@@ -156,4 +156,25 @@ The setup script signs in with delegated Microsoft Graph scopes (`Sites.Manage.A
 + `Sites.ReadWrite.All`) via device-code flow. See the top of
 [`src/services/graph.ts`](../src/services/graph.ts) for the exact `GRAPH_SCOPES`
 list. Runtime uses the same delegated token, refreshed silently through the local
-MSAL cache — no admin consent or application permissions are required.
+MSAL cache. The public-client application must be allowed to request those
+delegated permissions; tenant consent policy can require administrator approval.
+Application permissions are not used by this sample.
+
+## Reusing a site with a new blueprint
+
+A new agent blueprint does not require new SharePoint lists when the tenant,
+`SHAREPOINT_SITE_URL`, and `SHAREPOINT_LISTS_PREFIX` are unchanged. Run
+`npm run setup:sharepoint` to sign in on a fresh machine and create only missing
+lists. Existing lists and their items are preserved; do not run the seed scripts
+unless you intend to insert or update roster data.
+The setup script skips existing lists; it does not migrate their schemas.
+
+Conversation references belong to the agent conversation, not just the user.
+After creating a new blueprint and agent instance, have every participating user
+message the new agent once to refresh `SMA_TeamMembers.ConversationRef`, then run
+`/config channel` in the target Teams channel to refresh its configuration.
+Keep `LOCAL_CRON=false` until these references and the roster are verified.
+
+For a different tenant, provision the lists in an accessible site in that tenant
+and migrate required business data separately. Do not copy old conversation
+references or assume that user, team, and channel IDs remain valid.

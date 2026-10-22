@@ -419,6 +419,50 @@ depends on model output. Everything else is TypeScript.
   observability exporter via `ENABLE_A365_OBSERVABILITY_EXPORTER`. This
   scenario inherits that path unchanged.
 
+### Troubleshooting missing Defender activity
+
+Purview API audit records and Agent 365 SDK traces use different collection
+paths. Successful Purview auditing does not prove that SDK traces are exported
+or available in Defender Advanced Hunting.
+
+1. **Check export authentication.** For this sample's delegated agent-user
+   export flow, grant admin consent for
+   `Agent365.Observability.OtelWrite` on the Agent365Observability resource
+   (`9b975845-388f-4429-889e-eab1ef63949c`). Configure the blueprint's
+   inheritable delegated permissions and the agent-user consent according to
+   your tenant's provisioning policy. Preserve existing grants.
+   `AADSTS65001` means consent is missing; enabling the exporter alone does
+   not resolve it.
+2. **Verify the runtime identity.** The export token, exporter URL, and
+   `gen_ai.agent.id` must identify the agent instance, not its blueprint.
+   Use the blueprint ID only as metadata. See
+   [`src/observability.ts`](../src/observability.ts).
+3. **Generate a traced operation.** Ask a read-only sprint question in the
+   matching agent's chat. `/help` returns before the LLM tracing path.
+   Inspect the export response for per-span sink results and rejected spans;
+   an HTTP 200 or a token-preload log alone is not proof of ingestion.
+4. **Check hunting independently.** First run
+   `CloudAppEvents | take 5`. An unresolved-table error is a schema or service
+   accessibility problem, not an empty result. Check Defender for Cloud Apps
+   provisioning, access permissions, and the Microsoft 365 connector under
+   **Settings > Cloud Apps > App Connectors**. Verify that **Microsoft 365
+   activities** collection is selected; a **Connected** status alone does
+   not establish that activity collection is enabled.
+5. Once the table resolves, search by the runtime agent identity or agent-user
+   object ID with a suitable time range. Allow for ingestion latency, and
+   verify actual query results before declaring Defender visibility working.
+
+`AgentsInfo` is agent inventory, not conversation activity. Its `AgentId` can
+be a Defender inventory identifier rather than the blueprint or runtime
+identity ID. Inspect the tenant's actual columns and records before filtering;
+the published blueprint ID may appear inside `RawAgentInfo`. An inventory row
+does not prove that `CloudAppEvents` is available or that a conversation trace
+has arrived.
+
+References: [Agent 365 observability concepts](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/observability-concepts),
+[CloudAppEvents prerequisites](https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-cloudappevents-table),
+and [Microsoft 365 connector setup](https://learn.microsoft.com/en-us/defender-cloud-apps/protect-office-365).
+
 ## 11. Extension points
 
 - **Add a new slash command** — extend `SlashCommand` union in
