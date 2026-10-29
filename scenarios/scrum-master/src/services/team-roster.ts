@@ -15,6 +15,8 @@
 
 import { TurnContext } from '@microsoft/agents-hosting';
 import { ConversationReference } from '@microsoft/agents-activity';
+import { getJiraMode } from '../config';
+import { getJiraClient } from './jira';
 import {
     createItem,
     findByField,
@@ -40,6 +42,40 @@ export interface TeamMember extends TeamMemberFields {
 }
 
 const cache = new Map<string, TeamMember>();   // AadObjectId -> member
+const mockMembers = new Map<string, TeamMember>(); // Jira account -> distinct persona
+
+async function listMockMembers(): Promise<TeamMember[]> {
+    const jira = getJiraClient();
+    const sprint = await jira.getActiveSprint();
+    if (sprint) {
+        const parents = await jira.searchSprintIssues(sprint.id);
+        const subtasks = await jira.getSprintSubtasks(sprint.id, parents.filter(i => !i.parentKey).map(i => i.key));
+        const issues = [...parents, ...subtasks];
+        for (const issue of issues) {
+            const user = issue.assignee;
+            if (!user || mockMembers.has(user.accountId)) continue;
+            mockMembers.set(user.accountId, {
+                itemId: `mock-${user.accountId}`,
+                Title: user.displayName,
+                Email: user.emailAddress ?? '',
+                AadObjectId: `mock-${user.accountId}`,
+                JiraAccountId: user.accountId,
+                TimeZone: 'UTC',
+                Role: user.accountId === 'acc-alex' ? 'SM' : 'Dev',
+                conversationReference: null,
+            });
+        }
+    }
+    return Array.from(mockMembers.values());
+}
+
+/** Missing conversationType is used by Playground's one-to-one conversations. */
+export function isPersonalConversation(reference: Partial<ConversationReference>): boolean {
+    const conversation = reference.conversation;
+    return !!conversation
+        && conversation.isGroup !== true
+        && (!conversation.conversationType || conversation.conversationType === 'personal');
+}
 
 function toDomain(item: ListItem<TeamMemberFields>): TeamMember {
     const f = item.fields;
@@ -62,6 +98,7 @@ function toDomain(item: ListItem<TeamMemberFields>): TeamMember {
 }
 
 export async function listTeamMembers(): Promise<TeamMember[]> {
+    if (getJiraMode() === 'mock') return listMockMembers();
     const items = await listItems<TeamMemberFields>('teamMembers');
     const members = items.map(toDomain);
     members.forEach(m => cache.set(m.AadObjectId, m));
@@ -69,6 +106,9 @@ export async function listTeamMembers(): Promise<TeamMember[]> {
 }
 
 export async function getMemberByAadId(aadObjectId: string): Promise<TeamMember | null> {
+    if (getJiraMode() === 'mock') {
+        return (await listMockMembers()).find(m => m.AadObjectId === aadObjectId) ?? null;
+    }
     if (cache.has(aadObjectId)) return cache.get(aadObjectId)!;
     const items = await findByField<TeamMemberFields>('teamMembers', 'AadObjectId', aadObjectId);
     if (items.length === 0) return null;
@@ -78,6 +118,9 @@ export async function getMemberByAadId(aadObjectId: string): Promise<TeamMember 
 }
 
 export async function getMemberByJiraAccountId(jiraAccountId: string): Promise<TeamMember | null> {
+    if (getJiraMode() === 'mock') {
+        return (await listMockMembers()).find(m => m.JiraAccountId === jiraAccountId) ?? null;
+    }
     for (const m of cache.values()) if (m.JiraAccountId === jiraAccountId) return m;
     const items = await findByField<TeamMemberFields>('teamMembers', 'JiraAccountId', jiraAccountId);
     if (items.length === 0) return null;
@@ -93,12 +136,33 @@ export async function getMemberByJiraAccountId(jiraAccountId: string): Promise<T
  */
 export async function upsertConversationReference(context: TurnContext): Promise<void> {
     const from = context.activity?.from;
-    const aadId = from?.aadObjectId;
+    const mock = getJiraMode() === 'mock';
+    const aadId = from?.aadObjectId || (mock ? from?.id : undefined);
     if (!aadId) return; // no AAD id => nothing we can key on
 
     const convRef = context.activity.getConversationReference();
+    // Channel/group turns must never replace a destination used for private cards.
+    const channelData = context.activity.channelData as { channel?: { id?: string }; teamsChannelId?: string } | undefined;
+    if (!isPersonalConversation(convRef) || channelData?.channel?.id || channelData?.teamsChannelId) return;
     const convRefJson = JSON.stringify(convRef);
     const nowIso = new Date().toISOString();
+
+    if (mock) {
+        const members = await listMockMembers();
+        const existing = members.find(m => m.AadObjectId === aadId);
+        // A fresh Playground caller plays the SM; subsequent callers get distinct
+        // unused personas, rather than routing every developer's cards to one user.
+        const member = existing
+            ?? members.find(m => m.Role === 'SM' && !m.conversationReference)
+            ?? members.find(m => !m.conversationReference);
+        if (member) {
+            member.AadObjectId = aadId;
+            member.conversationReference = convRef;
+            member.ConversationRef = convRefJson;
+            member.LastSeenUtc = nowIso;
+        }
+        return;
+    }
 
     const existing = await findByField<TeamMemberFields>('teamMembers', 'AadObjectId', aadId);
     if (existing.length > 0) {
@@ -132,5 +196,5 @@ export async function upsertConversationReference(context: TurnContext): Promise
  * in the standup summary so the SM knows who still needs onboarding.
  */
 export function isReachable(member: TeamMember): boolean {
-    return !!member.conversationReference;
+    return !!member.conversationReference && isPersonalConversation(member.conversationReference);
 }

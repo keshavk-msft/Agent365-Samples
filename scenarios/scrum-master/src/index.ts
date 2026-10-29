@@ -6,6 +6,9 @@
 import { configDotenv } from 'dotenv';
 configDotenv();
 
+import { installConsoleLogging } from './util/logger';
+installConsoleLogging();
+
 // Install global axios HTTP tracing (only active when LOG_HTTP=true). MUST run
 // before any module that imports axios makes a request, otherwise we miss the
 // early Jira / Graph calls.
@@ -77,10 +80,9 @@ server.get('/api/health', (req, res: Response) => {
 // BEFORE the JWT middleware because Functions call this over plain HTTP.
 const internalToken = getInternalTriggerToken();
 if (!internalToken) {
-  // Fail-shut in production so open /api/internal/* can never ship by mistake.
-  if (process.env.NODE_ENV === 'production') {
+  if (!isDevelopment) {
     console.error(
-      '[security] FATAL: INTERNAL_TRIGGER_TOKEN is required when NODE_ENV=production. ' +
+      '[security] FATAL: INTERNAL_TRIGGER_TOKEN is required outside NODE_ENV=development. ' +
       'Refusing to start with unauthenticated /api/internal/* endpoints.',
     );
     process.exit(1);
@@ -95,7 +97,9 @@ function requireInternalToken(req: express.Request, res: Response): boolean {
   if (!internalToken) {
     // Convention: empty token in .env => endpoint is open (dev-only). The one-shot
     // warning above logs this condition; each request stays quiet.
-    return true;
+    if (isDevelopment) return true;
+    res.status(503).json({ error: 'internal trigger token is not configured' });
+    return false;
   }
   if (provided !== internalToken) {
     res.status(401).json({ error: 'invalid internal token' });
@@ -127,7 +131,7 @@ server.post('/api/internal/nightly-check', async (req, res: Response) => {
   const result: Record<string, unknown> = { ok: true };
 
   // ?force=warn — run only Warn. ?force=report — run only Report.
-  // Anything else (default) runs both.
+  // The default also runs the date-gated T-2 RAG summary.
   try {
     if (force !== 'report') {
       result.warn = await runWarnCheck({ forceAlert });
@@ -146,7 +150,16 @@ server.post('/api/internal/nightly-check', async (req, res: Response) => {
     console.error('[internal] report failed:', (e as Error).message);
   }
 
-  res.status(200).json(result);
+  if (force !== 'warn' && force !== 'report') {
+    try {
+      result.summary = await runSprintSummary({ sprintId });
+    } catch (e) {
+      result.summaryError = (e as Error).message;
+      console.error('[internal] sprint-summary failed:', (e as Error).message);
+    }
+  }
+  result.ok = !Object.keys(result).some(key => key.endsWith('Error'));
+  res.status(result.ok ? 200 : 500).json(result);
 });
 
 server.post('/api/internal/sprint-summary', async (req, res: Response) => {

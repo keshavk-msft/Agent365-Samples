@@ -4,8 +4,8 @@
 /**
  * In-memory session store for in-flight standups.
  *
- * Sessions are short-lived: opened by the standup trigger, torn down after the
- * consolidated summary posts. SharePoint is the durable record; this cache
+ * Active sessions are torn down after the consolidated summary posts, retaining
+ * a small per-day completion record. SharePoint is the durable record; this cache
  * exists so response fan-in and cutoff timers don't need a round-trip per event.
  *
  * Session id convention: `<sprintId>#<yyyy-mm-dd>` — idempotent between the Azure
@@ -14,7 +14,7 @@
 
 import { JiraIssue } from './jira';
 
-export type StandupState = 'open' | 'summarized' | 'archived';
+export type StandupState = 'open' | 'summarizing' | 'summarized' | 'archived';
 
 export interface StandupItemResponse {
     issueKey: string;
@@ -52,6 +52,32 @@ export interface StandupSession {
 }
 
 const sessions = new Map<string, StandupSession>();
+const completed = new Map<string, { sentTo: number }>();
+
+export function getCompletedSession(standupId: string): { sentTo: number } | undefined {
+    return completed.get(standupId);
+}
+
+/** Claim before any await so final replies and the cutoff cannot both finalize. */
+export function claimSessionFinalization(session: StandupSession): boolean {
+    if (session.state !== 'open') return false;
+    session.state = 'summarizing';
+    if (session.cutoffTimer) {
+        clearTimeout(session.cutoffTimer);
+        session.cutoffTimer = undefined;
+    }
+    return true;
+}
+
+export function completeSession(session: StandupSession): void {
+    session.state = 'summarized';
+    completed.set(session.standupId, { sentTo: session.sentTo.size });
+    removeSession(session.standupId);
+    const day = todayKey();
+    for (const id of completed.keys()) {
+        if (id.slice(id.lastIndexOf('#') + 1) < day) completed.delete(id);
+    }
+}
 
 export function todayKey(now = new Date()): string {
     return now.toISOString().slice(0, 10);

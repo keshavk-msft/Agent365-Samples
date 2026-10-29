@@ -45,6 +45,20 @@ function parseArgs(): { mock: boolean; from: string | null } {
     return { mock, from };
 }
 
+export function resolveSeedIdentities(
+    rows: Array<Omit<TeamMemberFields, 'ConversationRef' | 'LastSeenUtc'>>,
+    me: { id: string; mail: string } | null,
+): void {
+    for (const row of rows) {
+        if (me?.mail && row.Email?.toLowerCase() === me.mail.toLowerCase()) {
+            row.AadObjectId = me.id;
+        }
+    }
+    if (new Set(rows.map(row => row.AadObjectId)).size !== rows.length) {
+        throw new Error('Roster contains duplicate AadObjectId values. Give each member a distinct identity before seeding.');
+    }
+}
+
 async function main() {
     const { mock, from } = parseArgs();
     const seedPath = from
@@ -62,22 +76,11 @@ async function main() {
     console.log(`[seed] Source: ${mock ? 'mock' : 'file'} (${seedPath})`);
     console.log(`[seed] Rows to seed: ${raw.length}`);
 
-    // Try to resolve the current signed-in user via Graph /me and use that AAD id
-    // for any row whose AadObjectId matches a placeholder OR whose Email matches
-    // the signed-in user's UPN. Zero-friction for the "Mario is both SM and demo
-    // user" scenario.
+    // Only an explicit email match identifies the signed-in user's row.
+    // Placeholder IDs belong to distinct people and must never collapse to /me.
     const me = await tryResolveCurrentUserAad();
-    if (me) {
-        console.log(`[seed] Signed-in user resolved: aadId=${me.id} email=${me.mail}`);
-        for (const row of raw) {
-            const isPlaceholder = row.AadObjectId === 'REPLACE_WITH_REAL_AAD_ID' || /^0{8}-/.test(row.AadObjectId);
-            const isSameEmail = me.mail && row.Email && row.Email.toLowerCase() === me.mail;
-            if (isPlaceholder || isSameEmail) {
-                console.log(`[seed]   patching ${row.Title} AadObjectId -> ${me.id}`);
-                row.AadObjectId = me.id;
-            }
-        }
-    } else {
+    resolveSeedIdentities(raw, me);
+    if (!me) {
         console.log('[seed] No Graph token available — rows with placeholder AAD ids will be inserted as-is.');
         console.log('[seed] Run `npm run setup:sharepoint` first if you want auto-resolve.');
     }
@@ -113,7 +116,9 @@ async function main() {
     console.log('[seed] Done.');
 }
 
-main().catch(err => {
-    console.error('[seed] Failed:', err?.message ?? err);
-    process.exit(1);
-});
+if (require.main === module) {
+    main().catch(err => {
+        console.error('[seed] Failed:', err?.message ?? err);
+        process.exit(1);
+    });
+}

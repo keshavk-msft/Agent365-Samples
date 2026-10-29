@@ -44,10 +44,12 @@ Every design decision below reflects one or more of these six principles:
    token cached to `.mstoken-cache.json`. No application-permission
    client secret is needed. Provisioning and runtime use the same
    `GRAPH_SCOPES`. See §7.
-5. **Durable state in SharePoint.** All persistent state lives in seven
-   `SMA_*` lists (see [`sharepoint-schema.md`](./sharepoint-schema.md)).
-   Restarts recover cleanly. Only the fast per-turn cache in
-   `session-store.ts` is in-memory.
+5. **SharePoint records with explicit process-local limits.** Live roster,
+   response, blocker and report-delivery records live in `SMA_*` lists.
+   Standup fan-in, cutoff timers, completed daily session records and Q&A
+   history are in-memory. A restart does not reconstruct an in-flight
+   standup, and multiple agent processes do not share its guard. Mock mode
+   uses in-memory services rather than durable SharePoint.
 6. **Jira is the source of truth for issue state.** The agent writes back
    via comments and transitions but never invents data. Every LLM reply is
    grounded through a Jira tool call — no hallucinated status.
@@ -134,7 +136,7 @@ flowchart TB
 
     subgraph Cron[src/cron/local-scheduler.ts]
         S1[STANDUP_CRON → standup]
-        S2[NIGHTLY_CRON → warn + report]
+        S2[NIGHTLY_CRON → warn + mid-sprint summary + close report]
     end
     Cron --> Handlers
 ```
@@ -149,18 +151,20 @@ message handlers but not code. They only touch each other through those stores.
 `src/index.ts` runs, in order:
 
 1. `configDotenv()` — populate `process.env`.
-2. `installHttpLogging()` — global axios tracer, no-op when `LOG_HTTP=false`.
+2. Install the scenario level-based logger and axios HTTP tracing
+   (`LOG_LEVEL` and `LOG_HTTP`).
 3. `printStartupBanner()` — one-shot config summary so misconfig is loud.
 4. Register `unhandledRejection` + `uncaughtException` process handlers.
-5. Import `agent.ts` (which wires the router and starts `local-scheduler`).
+5. Import `agent.ts`, which wires the router.
 6. Mount `/api/health` (unauthenticated), `/api/internal/*` (shared-secret
    guarded), then the JWT middleware, then `/api/messages`.
-7. Bind to `PORT` (default `3978`).
+7. Bind to `PORT` (default `3978`), then start the local scheduler if enabled.
 
 ### 4.2 Every user turn
 
 1. Teams POSTs an Activity to `/api/messages`.
-2. `authorizeJWT` validates the token.
+2. `authorizeJWT` validates the token except when `NODE_ENV=development`.
+   That development bypass is for local testing, not public hosting.
 3. `CloudAdapter.process` unpacks the activity, calls `agentApplication.run(context)`.
 4. The router in [`agent.ts`](../src/agent.ts):
    - Captures the sender's `ConversationReference` into
@@ -179,7 +183,11 @@ message handlers but not code. They only touch each other through those stores.
 `local-scheduler.ts` fires `node-cron` jobs (dev only — set `LOCAL_CRON=false`
 in prod and use the sibling `azure-functions/` package). Each cron callback
 hits the same handler as the equivalent internal HTTP endpoint, so the two
-paths are behaviourally equivalent and share idempotency guards.
+paths invoke the same ceremony handlers. Both evaluate cron expressions in
+**UTC**; `TIMEZONE` is used for local-date gates, labels and meeting-slot
+searches, not cron evaluation. The nightly paths run Warn, mid-sprint summary
+and sprint-close checks. Use only one scheduler; shared handlers do not
+provide a cross-process standup lock.
 
 ## 5. The seven flows
 
@@ -191,7 +199,7 @@ sequenceDiagram
     participant Standup as handlers/standup.ts
     participant Roster as SMA_TeamMembers
     participant Jira as jira.ts
-    participant Sessions as SMA_StandupSessions
+    participant Sessions as In-memory standup session + SharePoint records
     participant DM as proactive.ts → each member
     participant Sub as handleStandupSubmit
     participant Sum as summarizeStandup
@@ -199,7 +207,7 @@ sequenceDiagram
     Trigger->>Standup: triggerStandup()
     Standup->>Roster: list active members
     Standup->>Jira: getActiveSprint + searchSprintIssues
-    Standup->>Sessions: create row (state=pending, Title=<sprintId>#<date>)
+    Standup->>Sessions: open process-local session + persist live session record
     Standup->>DM: send request card per member with their tasks
     DM-->>Sub: user submits card {items:[{issueKey,update,blocker?}]}
     Sub->>Sessions: write SMA_StandupResponses row
@@ -209,13 +217,19 @@ sequenceDiagram
     Sum-->>Sum: build summary card + post to configured channel
 ```
 
-Standup id = `<sprintId>#<yyyy-mm-dd>` — the natural idempotency key.
-Running the flow twice on the same day is a no-op.
+Standup id = `<sprintId>#<UTC yyyy-mm-dd>`. Completed daily records remain
+in-memory in the agent process, preventing a later trigger there from
+re-sending the day's cards. This is not a cross-process lock or a guarantee
+that a restarted process can resume its fan-in/cutoff state. Mock mode uses
+an in-memory roster and binds the first personal Playground caller to Alex;
+it needs no SharePoint or LLM credentials for `/standup`.
 
 ### 5.2 Reconcile (MVP 2)
 
 Free-text updates are classified by a deterministic phrase table in
-[`handlers/reconcile.ts`](../src/handlers/reconcile.ts). First rule to match wins.
+[`handlers/reconcile.ts`](../src/handlers/reconcile.ts). Completion inference
+is conservatively refused when negation is present; otherwise the first
+matching rule wins.
 
 | Target | Trigger patterns (case-insensitive) |
 |---|---|
@@ -230,7 +244,21 @@ card DM to the SM, who approves per-row and clicks **Apply approved**. The
 LLM is *not* involved in reconcile — a demo run has 100 % deterministic
 behaviour on this path.
 
+The card carries only `standupId` and approval toggles. The server requires
+the SM's AAD object id and looks up its pending proposal (24-hour TTL);
+issue keys and transitions are not trusted from the submission. Apply/skip
+consumes that proposal. Replayed, expired or post-restart submissions fail
+closed and require a new proposal.
+
 ### 5.3 Chase (MVP 3)
+
+Booking uses a conditional SharePoint state claim, `open → booking → booked`,
+so repeated submissions cannot independently create the same meeting.
+Uncertain calendar failures retain the claim rather than inviting twice.
+A malformed verification response may mark the blocker booked even when
+event details could not be recorded. An operator must verify Outlook/event
+delivery before reopening a blocker or retrying; see
+[`Claim recovery`](../README.md#claim-recovery).
 
 ```mermaid
 sequenceDiagram
@@ -312,7 +340,7 @@ the last discussed task — no need to repeat the key.
 ### 5.6 Mid-sprint RAG (MVP 6)
 
 `handlers/sprint-summary.ts` is called by the internal
-`sprint-summary?force=true` endpoint (or the T-2 timer). Every task is
+`sprint-summary?force=true` endpoint or the nightly scheduler's T-2 check. Every task is
 classified:
 
 - **RED** — `dueDate < today` and status not `Done`
@@ -323,17 +351,30 @@ classified:
 The output is a prioritised markdown table posted inline to the configured
 channel — no attachments, no SharePoint upload.
 
+This path has no durable delivery guard. A repeated eligible invocation,
+including a retry of the nightly HTTP call after another check throws, can
+post the T-2 summary again. Successful checks are not rolled back when the
+nightly route returns HTTP 500 with `ok: false`.
+
 ### 5.7 Sprint close (MVP 7)
 
 `handlers/report.ts` builds a management-ready markdown message
 (completed user stories, deliverables, deployments, demo highlights,
 release notes, action items table, sprint metrics table) and posts it
-inline to the channel. Idempotency key = `<sprintId>` on the
-`SMA_SprintSessions` row.
+inline to the channel. Live mode uses `SMA_SprintReportsDelivery`, keyed by
+`sprint-close:<sprintId>`, with an indexed, uniqueness-enforced key and conditional
+claim updates. A recorded successful delivery prevents nightly re-posts;
+`force` bypasses the end-date gate, not the delivery guard. This is not a
+transaction spanning SharePoint and Teams: a crash after a send but before
+recording success requires operator review rather than assuming exactly-once
+delivery. An ambiguous/crashed claim stays `claimed` without automatic expiry;
+an explicit delivery failure is marked `failed` and may be retried. Mock
+mode's delivery records are in-memory.
 
 ## 6. Data model
 
-All persistent state lives in SharePoint. Complete column-level reference:
+Live persistent records live in SharePoint; session aggregation and Q&A
+history remain process-local. Complete column-level reference:
 [`sharepoint-schema.md`](./sharepoint-schema.md). Summary:
 
 | List | Purpose | Idempotency key |
@@ -345,6 +386,7 @@ All persistent state lives in SharePoint. Complete column-level reference:
 | `SMA_Blockers` | One row per flagged blocker | `<StandupId>#<issueKey>` |
 | `SMA_SprintRisks` | One row per Warn firing | `<sprintId>#<date>` |
 | `SMA_HelperRoster` | SME topics for chase | `Title` (topic) |
+| `SMA_SprintReportsDelivery` | Sprint-close claim and delivery status (`claimed` / `sent` / `failed`) | Unique `DeliveryKey = sprint-close:<sprintId>` |
 
 ## 7. Auth model — delegated Graph only
 
@@ -353,9 +395,10 @@ All persistent state lives in SharePoint. Complete column-level reference:
   `Sites.ReadWrite.All`, `Sites.Manage.All`, `Files.ReadWrite.All`,
   `User.Read`, `offline_access`. Tokens cached to `.mstoken-cache.json`.
   `GRAPH_CLIENT_ID` defaults to the well-known **Microsoft Graph Command
-  Line Tools** public client id, which is pre-consented on most tenants —
-  zero-registration onboarding. Register your own multi-tenant public
-  client for a real deployment.
+  Line Tools** public client id (`14d82eec-204b-4c2f-b7e8-296a70dab67e`)
+  when blank/unset. This avoids local app registration, not tenant policy
+  or delegated-permission consent. Register your own public client for a
+  real deployment.
 - **Jira Cloud** — Basic auth with `email:apiToken`. Token from
   [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens).
 - **Azure OpenAI / OpenAI** — API key from `.env`.
@@ -365,7 +408,8 @@ All persistent state lives in SharePoint. Complete column-level reference:
 **No application-permission Graph client.** Everything a user touches
 they touch as themselves. Adding application permissions was intentionally
 avoided to keep the onboarding story to a single device-code sign-in and
-no admin consent.
+no application-permission grant. Delegated scopes can still require admin
+consent under the tenant's policies.
 
 ## 8. Determinism boundary — where the LLM lives
 
@@ -389,17 +433,23 @@ depends on model output. Everything else is TypeScript.
   `context.sendActivity('working on it…')`, downstream work runs via
   `setImmediate`. Follow-ups arrive as proactive DMs against the cached
   conversation reference.
-- **Every scheduled path is idempotent by natural key.**
-  - Standup — `<sprintId>#<yyyy-mm-dd>`
-  - Warn — same
-  - Blocker — `<StandupId>#<issueKey>`
-- **Running `local-scheduler` and Azure Function timers simultaneously is
-  safe** but wasteful (two Jira reads per tick). Set `LOCAL_CRON=false`
-  when Functions are deployed.
-- **Session cache** in `session-store.ts` is in-memory. A restart mid-standup
-  drops the pending session; the standup row in `SMA_StandupSessions`
-  still exists but requires a manual re-post via
-  `POST /api/internal/standup-trigger`. See §12.
+- **Deduplication has different scopes.** Standup daily records
+  (`<sprintId>#<UTC-date>`) remain in-memory after completion. Warn/blocker
+  records use their own natural keys; a key alone is not an atomic lock.
+  Sprint-close reports use the durable per-sprint delivery claim described
+  in §5.7.
+- **Not all scheduled paths are idempotent.** The mid-sprint summary has no
+  durable delivery guard; retrying a partially successful nightly call can
+  repeat its T-2 output.
+- **Use one scheduler and one standup agent process.** Set `LOCAL_CRON=false`
+  when Functions are deployed. Multiple schedulers/replicas are not made
+  safe by the process-local standup guard.
+- **Session state** in `session-store.ts` is in-memory. A restart drops
+  pending fan-in and cutoff timers; a persisted SharePoint row does not
+  rebuild them. Live triggers check existing SharePoint records before new
+  fanout, but this check is not atomic across processes. Failed finalization
+  stays `summarizing` to avoid an ambiguous duplicate post; inspect existing
+  records before manually recovering a run.
 
 ## 10. Observability
 
@@ -407,17 +457,21 @@ depends on model output. Everything else is TypeScript.
   prints a one-shot config summary at boot with `[MISSING]` markers for
   unset vars. Runs before any handler is imported.
 - **Level-based logger** — [`src/util/logger.ts`](../src/util/logger.ts)
-  gates output by `LOG_LEVEL` (`error|warn|info|debug|trace`), tags every
-  line with a scope + timestamp, and redacts credential-shaped values.
+  installs console level filtering via `LOG_LEVEL`
+  (`error|warn|info|debug|trace`). Calls made through its `log` helper also
+  receive scope/timestamp formatting and metadata redaction; raw console
+  calls are not automatically redacted.
 - **HTTP tracing** — [`src/util/httpLogger.ts`](../src/util/httpLogger.ts)
-  hooks a global axios interceptor when `LOG_HTTP=true`, printing
-  `method host path status latency` for every outbound Jira / Graph /
-  MCP call. Off by default — production noise otherwise.
+  attaches interceptors to instrumented axios clients, including Jira, when
+  `LOG_HTTP=true`, printing `method host path status latency`. It does not
+  trace Graph's fetch client or MCP transports. Off by default.
 - **Process safety nets** — `unhandledRejection` and `uncaughtException`
   handlers in `index.ts` log and continue. Scheduler survives Graph 502s.
 - **Agent 365 observability** — the base sample enables the A365
   observability exporter via `ENABLE_A365_OBSERVABILITY_EXPORTER`. This
-  scenario inherits that path unchanged.
+  scenario adds runtime-identity binding, baggage propagation and handler
+  scopes in [`src/observability.ts`](../src/observability.ts); enabling an
+  exporter alone is not proof of successful cloud ingestion.
 
 ### Troubleshooting missing Defender activity
 
@@ -487,14 +541,15 @@ and [Microsoft 365 connector setup](https://learn.microsoft.com/en-us/defender-c
   Multi-team support requires a `SMA_Teams` list, a `TeamId` column on
   every existing list, and per-team Jira credentials in Key Vault. Sketch
   is in the README under "Known limitations".
-- **In-memory session cache.** A nodemon restart mid-standup requires a
-  manual re-fire. Fix: swap `session-store.ts` for a SharePoint-backed
-  store, keyed by `standupId`.
+- **In-memory standup aggregation/daily guard.** A restart loses session
+  state and cutoff timers. Safe scale-out/recovery needs shared atomic
+  claims plus durable fan-in and timer reconstruction, not just a stored
+  standup id. Review persisted records before recovering manually.
 - **`.mstoken-cache.json` is unencrypted.** Fine for local dev; swap for
   Key Vault or a DPAPI-backed extension in production.
 - **`GRAPH_CLIENT_ID` uses the shared "Microsoft Graph Command Line Tools"
-  public client.** Zero-setup, but production deployments should register
-  their own multi-tenant public client.
+  public client when blank/unset.** Tenant consent and policies still
+  apply; production deployments should register their own public client.
 - **No zod validation on Q&A LLM output.** Currently trusts `result.finalOutput`
   as a string. Cheap fix — wrap the return in a `z.string().min(1)` guard.
 - **`GRAPH_TENANT_ID=common` allows any tenant to sign in.** Pin to a

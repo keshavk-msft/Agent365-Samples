@@ -89,7 +89,7 @@ export interface GraphAuthConfig {
 export function getGraphAuthConfig(): GraphAuthConfig {
     return {
         tenantId: optional('GRAPH_TENANT_ID', 'common'),
-        clientId: required('GRAPH_CLIENT_ID'),
+        clientId: optional('GRAPH_CLIENT_ID', '14d82eec-204b-4c2f-b7e8-296a70dab67e'),
     };
 }
 

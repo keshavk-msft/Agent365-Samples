@@ -25,7 +25,7 @@ An autonomous **Scrum Master** built on the [Microsoft Agent 365 SDK](https://gi
 
 ## What it does
 
-Seven capabilities, each a handler under [`src/handlers/`](src/handlers). All use proactive DMs, durable state in SharePoint, and grounded tool calls into Jira — no hallucinated status.
+Seven capabilities, each a handler under [`src/handlers/`](src/handlers). Live mode uses proactive DMs, SharePoint records, and grounded Jira tools. Standup aggregation and daily deduplication are process-local; they do not survive restart or coordinate replicas.
 
 1. **Standup** — Proactively DMs every squad member an Adaptive Card listing their sprint tasks with an update field and blocker toggle. Aggregates responses into a summary card posted to the configured channel. See [`handlers/standup.ts`](src/handlers/standup.ts).
 2. **Board reconciliation** — A deterministic phrase classifier reads each update, maps it to a Jira status, and either auto-applies safe forward transitions or DMs the Scrum Master an approval card for ambiguous moves. See [`handlers/reconcile.ts`](src/handlers/reconcile.ts).
@@ -39,7 +39,7 @@ Full flow diagrams for each capability are in [`docs/design.md#5-the-seven-flows
 
 ## Prerequisites
 
-Fast path (mock mode): **only Node.js is required.** All external services can be skipped.
+Fast path (mock standup): **Node.js and npm are required.** Jira and roster data are in-memory; no Graph/SharePoint setup is needed for this path. Free-text Q&A still requires OpenAI or Azure OpenAI credentials and network access.
 
 | Requirement | Needed for | Notes |
 |---|---|---|
@@ -51,14 +51,15 @@ Fast path (mock mode): **only Node.js is required.** All external services can b
 
 ## Quick start — mock mode (no external services)
 
-Get from clone to a working demo in under 5 minutes. Uses the built-in mock Jira sprint in [`src/mock/jira-mock.ts`](src/mock/jira-mock.ts) — a mutable in-memory board that responds to transitions and comments the same way live Jira would.
+Uses the built-in mock Jira sprint in [`src/mock/jira-mock.ts`](src/mock/jira-mock.ts) and an in-memory roster/standup path. This exercises local card interactions, not real Teams delivery or SharePoint persistence.
 
 ```powershell
 git clone https://github.com/microsoft/Agent365-Samples.git
 cd Agent365-Samples/scenarios/scrum-master
 
 cp .env.template .env
-# Edit .env: set AZURE_OPENAI_* (or OPENAI_API_KEY), leave JIRA_MODE=mock.
+# Leave JIRA_MODE=mock and JIRA_PROJECT_KEY=SCRUM.
+# For optional free-text Q&A, set AZURE_OPENAI_* (or OPENAI_API_KEY).
 
 npm install
 npm run dev
@@ -70,10 +71,10 @@ In another terminal:
 npm run test-tool     # opens the Agents Playground
 ```
 
-In the Playground, DM the agent `/standup`. The agent will DM a standup card for the mock sprint. Fill in an update, click **Submit**, and watch the summary card land. Then try:
+In a personal Playground conversation, DM the agent `/standup`. The first caller is bound to the mock Alex (Scrum Master) roster entry and receives Alex's tasks. Other mock assignees are unreachable until they interact in their own conversations; this is not a four-member delivery proof. Fill in an update and click **Submit**. The summary waits for expected responses or the cutoff. Then try:
 
-- `What's the status of Task-1?` — grounded Q&A over the mock board
-- `What's blocking Task-6?` — inspects the mock blocker
+- `What's the status of Task-1?` — grounded Q&A over the mock board (requires LLM credentials)
+- Submit an update first, then ask for that task's latest comments — the mock starts without standup comments or seeded blockers
 - `/help` — full command list
 
 ## Full setup — live mode
@@ -112,6 +113,9 @@ JIRA_PROJECT_KEY=DEMO
 JIRA_BOARD_ID=1
 
 SHAREPOINT_SITE_URL=https://<your-tenant>.sharepoint.com/sites/<your-site>
+GRAPH_TENANT_ID=<your-tenant-id>
+# Optional override; blank uses the Graph CLI public client. Tenant consent may be required.
+GRAPH_CLIENT_ID=
 INTERNAL_TRIGGER_TOKEN=<any-random-string>
 ```
 
@@ -122,8 +126,8 @@ Full var reference in [Configuration reference](#configuration-reference) below.
 ```powershell
 npm install
 
-# Signs in via device code (Microsoft Graph delegated). Creates the 7 SMA_*
-# lists + SprintReports library. Idempotent.
+# Signs in via device code (Microsoft Graph delegated). Creates the SMA_*
+# lists (including SprintReportsDelivery) + SprintReports library. Idempotent.
 npm run setup:sharepoint
 
 # Seed the SMA_TeamMembers list from src/scripts/team.sample.json.
@@ -181,6 +185,14 @@ Sanity check that the runtime is wired correctly, in three minutes:
 
 If all three succeed the sample is fully wired.
 
+Run the local regression suite after `npm install`:
+
+```powershell
+npm test
+```
+
+These tests do not replace the live service and delivery checks above.
+
 ## Try each capability
 
 Slash commands and free-text go to the agent DM. Card actions come back as follow-up DMs or channel posts.
@@ -203,22 +215,22 @@ Every scenario-specific env var — see [`.env.template`](.env.template) for the
 
 | Variable | Default | Required for | Description |
 |---|---|---|---|
-| `LOG_LEVEL` | `info` | Never | `error` / `warn` / `info` / `debug` / `trace` |
-| `LOG_HTTP` | `false` | Debugging | `true` traces every outbound axios call (Jira / Graph / MCP) |
-| `JIRA_MODE` | `mock` | Everything | `mock` runs offline; `live` calls Atlassian. |
+| `LOG_LEVEL` | `info` | Never | Central console filtering: `error` / `warn` / `info` / `debug` / `trace`; SDK-specific logging may have additional controls |
+| `LOG_HTTP` | `false` | Debugging | Traces instrumented axios clients, including Jira; not Graph/fetch or MCP transports |
+| `JIRA_MODE` | `mock` | Everything | `mock` uses in-memory Jira/roster data; Q&A still calls the configured LLM. `live` calls Atlassian. |
 | `JIRA_BASE_URL` | *(none)* | live | `https://<org>.atlassian.net` |
 | `JIRA_EMAIL` | *(none)* | live | Atlassian account email |
 | `JIRA_API_TOKEN` | *(none)* | live | Personal API token |
-| `JIRA_PROJECT_KEY` | *(none)* | live | Project key, e.g. `DEMO` |
+| `JIRA_PROJECT_KEY` | `SCRUM` (mock) | live | Keep `SCRUM` for the bundled mock; replace with your real project key in live mode |
 | `JIRA_BOARD_ID` | *(none)* | live | Numeric board id |
 | `SHAREPOINT_SITE_URL` | *(none)* | live | Site that hosts all `SMA_*` lists |
 | `SHAREPOINT_LISTS_PREFIX` | `SMA_` | live | Namespace prefix on every list |
 | `GRAPH_TENANT_ID` | `common` | live | Set to a single tenant guid to pin the sign-in |
-| `GRAPH_CLIENT_ID` | *(none)* | live | Public-client app id. `14d82eec-204b-4c2f-b7e8-296a70dab67e` (Microsoft Graph CLI) works on most tenants without additional consent. |
+| `GRAPH_CLIENT_ID` | `14d82eec-204b-4c2f-b7e8-296a70dab67e` | live Graph | Microsoft Graph CLI public client when blank/unset. Tenant policy and delegated-permission consent still apply; use your own public client for production. |
 | `STANDUP_CRON` | `0 30 3 * * 1-5` | Local scheduler | UTC cron — default = 09:00 IST weekdays |
 | `NIGHTLY_CRON` | `0 0 19 * * *` | Local scheduler | UTC cron — default = 00:30 IST daily |
 | `STANDUP_CUTOFF_HOURS` | `4` | Standup | Give people this long to respond before the summary posts anyway |
-| `TIMEZONE` | `Asia/Kolkata` | Display only | Used in card date rendering |
+| `TIMEZONE` | `Asia/Kolkata` | Local dates | Card labels, mid-sprint date gate, meeting-slot search; both cron schedulers evaluate in UTC independently of this setting |
 | `WARN_TODO_PCT` | `0.40` | Warn | Trip if this fraction of committed points is still `To Do` |
 | `WARN_SPRINT_PROGRESS_PCT` | `0.50` | Warn | Trip only after this fraction of sprint duration has elapsed |
 | `LOCAL_CRON` | `true` | Dev | Set `false` in prod once Azure Function timers are wired up |
@@ -226,11 +238,11 @@ Every scenario-specific env var — see [`.env.template`](.env.template) for the
 
 ## Internal HTTP endpoints
 
-All three are guarded by the `x-internal-token` header (must match `INTERNAL_TRIGGER_TOKEN`) and are designed for the Azure Function timers in the sibling [`azure-functions/`](azure-functions) folder — but curl-safe for demos.
+All three accept the `x-internal-token` header (must match a configured `INTERNAL_TRIGGER_TOKEN`) and are designed for the Azure Function timers in the sibling [`azure-functions/`](azure-functions) folder. A blank token leaves them open only when `NODE_ENV` is exactly `development`; every other value (including unset or `test`) requires a nonempty token at startup.
 
 ### `POST /api/internal/standup-trigger`
 
-Fires today's standup. Idempotent per calendar day.
+Fires today's standup. The `<sprintId>#<UTC-date>` guard retains completed records for the lifetime of this process. Live mode also checks persisted SharePoint session records before new fanout after restart, but this is not an atomic cross-process claim and does not reconstruct an interrupted session.
 
 ```powershell
 Invoke-RestMethod -Method Post `
@@ -243,17 +255,25 @@ Response: `{ "standupId": "1#2026-07-12", "sentTo": 4, "skipped": 0 }`
 
 ### `POST /api/internal/nightly-check`
 
-Runs the **Warn** check and, if the sprint has ended, the **Sprint close report**.
+Runs the **Warn** check, the **Mid-sprint RAG report** when its T-2 gate is met, and the **Sprint close report** if the sprint has ended.
+
+If any check throws, the response is HTTP 500 with `ok: false`, allowing the
+Functions retry policy to engage. Checks that already succeeded are not
+rolled back. The T-2 summary has no durable delivery guard, so retrying the
+nightly call can repeat its output even when another check caused the failure.
 
 Query params:
 - `force=warn` — Warn only
-- `force=report` — Report only, bypasses the "sprint has ended" gate
+- `force=report` — Report only, bypasses the "sprint has ended" gate, not the per-sprint delivery guard
 - `sprintId=<n>` — Override the auto-detected active sprint
 - `forceAlert=true` — Make Warn DM the SM regardless of thresholds (demo aid)
 
 ### `POST /api/internal/sprint-summary`
 
 Fires the mid-sprint RAG report to the configured channel.
+
+Unlike sprint-close reporting, this path has no durable delivery guard;
+repeated eligible calls can post repeated summaries.
 
 Query params:
 - `force=true` — bypass the "T-2 days from sprint end" gate
@@ -289,7 +309,28 @@ To reset Jira sprint issues, use the Atlassian UI or `POST /rest/agile/1.0/sprin
 
 ### Enable HTTP tracing
 
-If a live call fails silently, set `LOG_HTTP=true` in `.env` and restart. Every outbound axios call prints `method host path status latency`. Credentials are redacted automatically.
+For Jira REST diagnostics, set `LOG_HTTP=true` in `.env` and restart. Instrumented axios requests print `method host path status latency` with credential redaction. This does **not** trace Microsoft Graph's fetch transport or MCP traffic; use their SDK diagnostics separately. Keep HTTP tracing off in production.
+
+### Claim recovery
+
+Live operations claim SharePoint records before sending external side effects.
+Do not delete or reset a claim merely because a timer/card action was retried.
+
+- **Sprint close:** `SMA_SprintReportsDelivery.DeliveryKey` is unique and indexed
+  (`sprint-close:<sprintId>`). `sent` blocks another report; `failed` permits a
+  later retry. A crash or uncertain send can leave `claimed` indefinitely.
+  An operator must inspect Teams and delivery logs first. Confirm a delivered
+  report as `sent`; only after establishing that nothing was delivered should
+  an authorized operator mark the record `failed` and retry.
+- **Meeting booking:** `SMA_Blockers.State` is conditionally claimed from `open`
+  to `booking`, then set to `booked` after a confirmed booking. An uncertain
+  Calendar result may retain `booking` (or mark `booked` when verification
+  output is malformed). Check Outlook, event details and invitees before
+  recovery. Record an existing event as booked; reset to `open` for a new
+  proposal only after verifying that no event/invitations were created.
+- **Standup finalization:** an ambiguous failure can leave `summarizing`.
+  Inspect channel/DM delivery and persisted responses before recovery;
+  restarting does not rebuild response fan-in or cutoff timers.
 
 ## Deploy to Azure
 
@@ -298,12 +339,12 @@ Recommended target: **Azure App Service (Node 18/20) + Azure Functions timers**.
 Minimum runtime configuration:
 
 - Azure App Service (Linux, Node 20 LTS). Set `WEBSITES_PORT=3978`.
-- Application Settings: all `.env` vars mapped one-to-one.
+- Configure application settings explicitly; do **not** copy the local `.env` blindly. Required cloud overrides: `NODE_ENV=production`, `HOST=0.0.0.0`, and a nonempty random `INTERNAL_TRIGGER_TOKEN`. Supply live Jira, Graph, LLM and hosting/auth connection settings securely; never commit secrets.
 - Health check path: `/api/health`.
-- Always-On: enabled — the local cron scheduler needs the process to stay warm. Alternative: set `LOCAL_CRON=false` and use the sibling [`azure-functions/`](azure-functions) package for timer triggers.
+- Always-On: enabled for the long-lived agent. Use the sibling [`azure-functions/`](azure-functions) package for timer triggers and set `LOCAL_CRON=false` on the agent so only one scheduler is active.
 - `.mstoken-cache.json` — for local dev only. In production, replace `graph.ts`'s file-backed MSAL cache with an Azure Key Vault-backed one (out of scope for this sample).
 
-Deploy pattern used successfully in dev tenants:
+Example deployment commands (replace placeholders; no deployment validation is implied):
 
 ```powershell
 # From the scenario folder
@@ -318,15 +359,16 @@ Wire the Function App to point at your App Service:
 func azure functionapp publish <func-app-name>
 ```
 
-Set `INTERNAL_TRIGGER_URL` and `INTERNAL_TRIGGER_TOKEN` on the Function App so its timers can call `/api/internal/*` on the App Service.
+Set `AGENT_CALLBACK_URL=https://<your-agent-host>` (base URL, without `/api/messages`) and the same nonempty `INTERNAL_TRIGGER_TOKEN` on the Function App so its timers can call `/api/internal/*`. Leave `WEBSITE_TIME_ZONE` unset: timer expressions are UTC. Both schedulers run daily Warn, mid-sprint summary and sprint-close checks, each with its own eligibility gate.
 
 ## Known limitations
 
 - **MSAL token cache is unencrypted on disk** (`.mstoken-cache.json`, git-ignored). Fine for local dev; swap for Key Vault or a DPAPI-backed extension in production.
-- **`GRAPH_CLIENT_ID` defaults to the well-known "Microsoft Graph Command Line Tools" public client** for zero-setup device-code sign-in. Register your own multi-tenant public client for a real deployment.
+- **`GRAPH_CLIENT_ID` defaults to the well-known "Microsoft Graph Command Line Tools" public client** when blank/unset. This avoids creating an app for local sign-in, not tenant policy or admin consent. Register your own public client for a real deployment.
 - **Single-team by design.** The sample assumes one scrum team per process (single project key, single board, single channel). Multi-team support (per-team config, isolated Jira credentials, sharded timers) is called out as future work in [`docs/design.md#12-known-limitations--hardening-roadmap`](docs/design.md#12-known-limitations--hardening-roadmap).
 - **Proactive DMs require prior interaction.** Every squad member must have said "hi" to the agent at least once so their conversation reference is captured in `SMA_TeamMembers`.
-- **Running local `node-cron` and Azure Function timers simultaneously is safe** (`standupId = <sprintId>#<yyyy-mm-dd>` provides idempotency) but does two Jira reads per tick. Set `LOCAL_CRON=false` once the Function is deployed.
+- **Use one scheduler and one agent process for standups.** Completed daily standup records stay in-memory for that process only. A restart loses this local guard, and replicas have independent guards; SharePoint standup records are not a cross-process locking mechanism. Set `LOCAL_CRON=false` once the Function is deployed.
+- **Sprint-close delivery claims are separate from standup state.** Live mode uses `SMA_SprintReportsDelivery` with a unique per-sprint key. A crash or uncertain send leaves a `claimed` record requiring operator verification; it is not automatically retried. A confirmed delivery failure can be retried. `force=report` does not bypass this guard.
 
 ## Support
 

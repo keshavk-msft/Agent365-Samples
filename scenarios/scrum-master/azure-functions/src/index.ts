@@ -15,6 +15,11 @@
 import { app, InvocationContext, Timer } from '@azure/functions';
 import axios from 'axios';
 
+// Timer expressions are UTC; reject host settings that would reinterpret them.
+if (process.env.WEBSITE_TIME_ZONE && !['UTC', 'Etc/UTC'].includes(process.env.WEBSITE_TIME_ZONE)) {
+    throw new Error('Unset WEBSITE_TIME_ZONE (or use UTC): ceremony cron expressions are UTC.');
+}
+
 function agentUrl(path: string): string {
     const base = (process.env.AGENT_CALLBACK_URL ?? '').replace(/\/$/, '');
     if (!base) throw new Error('AGENT_CALLBACK_URL is not set.');
@@ -32,6 +37,7 @@ function headers(): Record<string, string> {
 // NCRONTAB is 6-field including seconds.
 app.timer('StandupTimer', {
     schedule: '0 30 3 * * 1-5',
+    retry: { strategy: 'fixedDelay', maxRetryCount: 3, delayInterval: { seconds: 30 } },
     handler: async (myTimer: Timer, context: InvocationContext) => {
         context.log('[StandupTimer] tick', { pastDue: myTimer.isPastDue });
         try {
@@ -41,7 +47,7 @@ app.timer('StandupTimer', {
             context.log('[StandupTimer] agent responded:', res.status, res.data);
         } catch (e) {
             context.error('[StandupTimer] call failed:', (e as Error).message);
-            throw e; // let Functions retry per host.json rules
+            throw e; // Functions applies the timer's explicit retry policy.
         }
     },
 });
@@ -49,6 +55,7 @@ app.timer('StandupTimer', {
 // 00:30 Asia/Kolkata daily = 19:00 UTC daily.
 app.timer('NightlyTimer', {
     schedule: '0 0 19 * * *',
+    retry: { strategy: 'fixedDelay', maxRetryCount: 3, delayInterval: { seconds: 30 } },
     handler: async (myTimer: Timer, context: InvocationContext) => {
         context.log('[NightlyTimer] tick', { pastDue: myTimer.isPastDue });
         try {

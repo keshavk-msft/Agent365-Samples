@@ -14,7 +14,7 @@
 // This file exists mainly for demo / triage: silent axios makes debugging
 // live-mode failures painful. Not needed in production.
 
-import axios, { AxiosError, AxiosResponse, InternalAxiosRequestConfig } from 'axios';
+import axios, { AxiosError, AxiosInstance, AxiosResponse, InternalAxiosRequestConfig } from 'axios';
 
 /** Marker attached to each request so we can compute latency on the way out. */
 interface Tagged extends InternalAxiosRequestConfig {
@@ -22,15 +22,18 @@ interface Tagged extends InternalAxiosRequestConfig {
     _traceId?: string;
 }
 
-let installed = false;
+const installed = new WeakSet<AxiosInstance>();
 
 export function installHttpLogging(): void {
-    if (installed) return;
-    installed = true;
+    attachHttpLogging(axios);
+}
 
+export function attachHttpLogging(instance: AxiosInstance): void {
+    if (installed.has(instance)) return;
     if (String(process.env.LOG_HTTP ?? '').toLowerCase() !== 'true') return;
+    installed.add(instance);
 
-    axios.interceptors.request.use((cfg: InternalAxiosRequestConfig) => {
+    instance.interceptors.request.use((cfg: InternalAxiosRequestConfig) => {
         const t = cfg as Tagged;
         t._startedAt = Date.now();
         t._traceId = Math.random().toString(36).slice(2, 8);
@@ -40,7 +43,7 @@ export function installHttpLogging(): void {
         return cfg;
     });
 
-    axios.interceptors.response.use(
+    instance.interceptors.response.use(
         (res: AxiosResponse) => {
             const t = res.config as Tagged;
             const ms = t._startedAt ? Date.now() - t._startedAt : -1;

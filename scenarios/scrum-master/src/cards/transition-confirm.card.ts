@@ -72,10 +72,6 @@ export function buildTransitionConfirmCard(p: TransitionConfirmCardParams): Atta
                     data: {
                         action: 'reconcile.apply',
                         standupId: p.standupId,
-                        // The submit will carry the toggle values; we serialize the transitions
-                        // for lookup on the server so the SM can't be spoofed into transitioning
-                        // arbitrary issues.
-                        transitions: JSON.stringify(p.transitions),
                     },
                 },
                 {

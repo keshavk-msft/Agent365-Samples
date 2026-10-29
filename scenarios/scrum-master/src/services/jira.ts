@@ -11,6 +11,7 @@
 import axios, { AxiosInstance, AxiosError } from 'axios';
 import { getJiraConfig, JiraConfig } from '../config';
 import { mockJira } from '../mock/jira-mock';
+import { attachHttpLogging } from '../util/httpLogger';
 
 export interface JiraUser {
     accountId: string;
@@ -59,6 +60,7 @@ export interface JiraComment {
 }
 
 export interface JiraClient {
+    getSprints?(state: 'active' | 'closed' | 'future'): Promise<JiraSprint[]>;
     getActiveSprint(): Promise<JiraSprint | null>;
     getSprint(sprintId: number): Promise<JiraSprint>;
     searchSprintIssues(sprintId: number): Promise<JiraIssue[]>;
@@ -77,7 +79,7 @@ export interface JiraClient {
     addComment(issueKey: string, body: string): Promise<void>;
 }
 
-class LiveJiraClient implements JiraClient {
+export class LiveJiraClient implements JiraClient {
     private readonly http: AxiosInstance;
 
     constructor(private readonly cfg: JiraConfig) {
@@ -91,6 +93,23 @@ class LiveJiraClient implements JiraClient {
                 'Content-Type': 'application/json',
             },
         });
+        attachHttpLogging(this.http);
+    }
+
+    async getSprints(state: 'active' | 'closed' | 'future'): Promise<JiraSprint[]> {
+        const sprints: JiraSprint[] = [];
+        let startAt = 0;
+        while (true) {
+            const res = await this.http.get(`/rest/agile/1.0/board/${this.cfg.boardId}/sprint`, {
+                params: { state, startAt, maxResults: 100 },
+            }).catch(this.wrap(`getSprints(${state})`));
+            const values: any[] = res.data?.values ?? [];
+            sprints.push(...values.map(mapSprint));
+            startAt += values.length;
+            if (!values.length || res.data.isLast === true ||
+                (typeof res.data.total === 'number' && startAt >= res.data.total)) break;
+        }
+        return sprints;
     }
 
     async getActiveSprint(): Promise<JiraSprint | null> {
@@ -109,26 +128,43 @@ class LiveJiraClient implements JiraClient {
     }
 
     async searchSprintIssues(sprintId: number): Promise<JiraIssue[]> {
-        const res = await this.http.get(`/rest/agile/1.0/sprint/${sprintId}/issue`, {
-            params: {
-                fields: 'summary,status,assignee,customfield_10016,duedate,parent,issuetype',
-                maxResults: 100,
-            },
-        }).catch(this.wrap(`searchSprintIssues(${sprintId})`));
-        const issues: any[] = res.data?.issues ?? [];
-        return issues.map(i => mapIssue(i, this.cfg.baseUrl, sprintId));
+        const issues: JiraIssue[] = [];
+        let startAt = 0;
+        while (true) {
+            const res = await this.http.get(`/rest/agile/1.0/sprint/${sprintId}/issue`, {
+                params: {
+                    fields: 'summary,status,assignee,customfield_10016,duedate,parent,issuetype',
+                    startAt, maxResults: 100,
+                },
+            }).catch(this.wrap(`searchSprintIssues(${sprintId})`));
+            const page: any[] = res.data?.issues ?? [];
+            issues.push(...page.map(i => mapIssue(i, this.cfg.baseUrl, sprintId)));
+            startAt += page.length;
+            if (!page.length || res.data.isLast === true ||
+                (typeof res.data.total === 'number' && startAt >= res.data.total)) break;
+        }
+        return Array.from(new Map(issues.map(i => [i.key, i])).values());
     }
 
     async getSprintSubtasks(sprintId: number, parentKeys: string[]): Promise<JiraIssue[]> {
         if (parentKeys.length === 0) return [];
         const jql = `parent in (${parentKeys.map(k => `"${k}"`).join(', ')})`;
-        const res = await this.http.post('/rest/api/3/search/jql', {
-            jql,
-            fields: ['summary', 'status', 'assignee', 'customfield_10016', 'duedate', 'parent', 'issuetype'],
-            maxResults: 200,
-        }).catch(this.wrap(`getSprintSubtasks(${parentKeys.length} parents)`));
-        const issues: any[] = res.data?.issues ?? [];
-        return issues.map(i => mapIssue(i, this.cfg.baseUrl, sprintId));
+        const issues: JiraIssue[] = [];
+        let nextPageToken: string | undefined;
+        const seenTokens = new Set<string>();
+        do {
+            const res = await this.http.post('/rest/api/3/search/jql', {
+                jql,
+                fields: ['summary', 'status', 'assignee', 'customfield_10016', 'duedate', 'parent', 'issuetype'],
+                maxResults: 100,
+                ...(nextPageToken ? { nextPageToken } : {}),
+            }).catch(this.wrap(`getSprintSubtasks(${parentKeys.length} parents)`));
+            issues.push(...(res.data?.issues ?? []).map((i: any) => mapIssue(i, this.cfg.baseUrl, sprintId)));
+            nextPageToken = res.data?.isLast === true ? undefined : res.data?.nextPageToken;
+            if (nextPageToken && seenTokens.has(nextPageToken)) throw new Error('Jira returned a repeated search page token');
+            if (nextPageToken) seenTokens.add(nextPageToken);
+        } while (nextPageToken);
+        return Array.from(new Map(issues.map(i => [i.key, i])).values());
     }
 
     async getIssue(issueKey: string): Promise<JiraIssue> {

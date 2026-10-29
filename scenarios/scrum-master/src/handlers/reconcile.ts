@@ -41,6 +41,14 @@ const RANK: Record<Exclude<TargetStatus, 'unchanged'>, number> = {
     'Done': 3,
 };
 
+interface PendingProposal {
+    approverAadId: string;
+    expiresAt: number;
+    transitions: ProposedTransition[];
+}
+
+const pendingProposals = new Map<string, PendingProposal>();
+
 /**
  * Rules ordered by strength — first match wins.
  * Patterns are intentionally loose (word-boundary case-insensitive) so real
@@ -77,10 +85,11 @@ export function classifyUpdateText(text: string, hasBlocker: boolean): TargetSta
     if (hasBlocker) return 'unchanged';
     const t = (text ?? '').trim();
     if (!t) return 'unchanged';
-    for (const rule of RULES) {
-        if (rule.patterns.some(p => p.test(t))) return rule.target;
+    if (/\b(not|never|no|cannot|can't|can’t|isn't|isn’t|wasn't|wasn’t|haven't|haven’t|hasn't|hasn’t|didn't|didn’t|don't|don’t|doesn't|doesn’t|won't|won’t|will|tomorrow)\b|\b(going to|plan to|planning to|hope to|expect to)\b/i.test(t)) {
+        return 'unchanged';
     }
-    return 'unchanged';
+    const matches = RULES.filter(rule => rule.patterns.some(p => p.test(t)));
+    return matches.length === 1 ? matches[0].target : 'unchanged';
 }
 
 /** Is the transition `from → to` a single forward step on our whitelist? */
@@ -187,9 +196,21 @@ export async function reconcileAfterStandup(session: StandupSession): Promise<Re
         transitions: outcome.needsConfirm,
     });
 
-    await sendProactive(sm.conversationReference, async ctx => {
+    for (const [id, proposal] of pendingProposals) {
+        if (proposal.expiresAt <= Date.now()) pendingProposals.delete(id);
+    }
+    pendingProposals.set(session.standupId, {
+        approverAadId: sm.AadObjectId,
+        expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+        transitions: outcome.needsConfirm.map(t => ({ ...t })),
+    });
+    const sent = await sendProactive(sm.conversationReference, async ctx => {
         await ctx.sendActivity({ type: 'message', attachments: [card] } as Partial<Activity> as Activity);
     });
+    if (!sent.ok) {
+        pendingProposals.delete(session.standupId);
+        console.warn(`[reconcile] Approval card delivery failed for ${session.standupId}.`);
+    }
 
     return outcome;
 }
@@ -200,15 +221,33 @@ export async function handleReconcileSubmit(context: TurnContext): Promise<void>
     const value = context.activity.value as Record<string, unknown> | undefined;
     const action = String(value?.action ?? '');
     const standupId = String(value?.standupId ?? '');
+    if (action !== 'reconcile.apply' && action !== 'reconcile.skipAll') return;
+
+    const callerId = context.activity.from?.aadObjectId ||
+        (process.env.NODE_ENV === 'development' && process.env.JIRA_MODE !== 'live'
+            ? context.activity.from?.id : undefined);
+    const members = await listTeamMembers();
+    const isScrumMaster = !!callerId && members.some(m =>
+        m.Role === 'SM' && m.AadObjectId.toLowerCase() === callerId.toLowerCase());
+    const proposal = pendingProposals.get(standupId);
+    if (!isScrumMaster || !proposal || proposal.expiresAt <= Date.now() ||
+        proposal.approverAadId.toLowerCase() !== callerId?.toLowerCase()) {
+        console.warn(`[reconcile] Rejected unauthorized, expired, or unknown proposal ${standupId}.`);
+        await context.sendActivity('This approval is unavailable or you are not its configured Scrum Master. No changes were applied.');
+        return;
+    }
     if (action === 'reconcile.skipAll') {
+        pendingProposals.delete(standupId);
         await context.sendActivity('Skipped — no board changes applied.');
         return;
     }
-    if (action !== 'reconcile.apply') return;
-
-    let transitions: ProposedTransition[] = [];
-    try { transitions = JSON.parse(String(value?.transitions ?? '[]')); }
-    catch { transitions = []; }
+    const transitions = proposal.transitions;
+    const knownKeys = new Set(transitions.map(t => t.issueKey));
+    if (Object.keys(value ?? {}).some(key => key.startsWith('approve_') && !knownKeys.has(key.slice(8)))) {
+        console.warn(`[reconcile] Rejected unknown issue selection for ${standupId}.`);
+        await context.sendActivity('The approval contains an unknown issue. No changes were applied.');
+        return;
+    }
 
     const approvedKeys = new Set<string>();
     for (const t of transitions) {
@@ -219,6 +258,7 @@ export async function handleReconcileSubmit(context: TurnContext): Promise<void>
         await context.sendActivity('No transitions were approved — nothing to apply.');
         return;
     }
+    pendingProposals.delete(standupId);
 
     // Ack immediately so the Teams card invoke completes inside its ~15s window.
     // Then do the actual Jira writes in the background and post the outcome via a
@@ -245,6 +285,11 @@ async function applyApprovedTransitionsAsync(
     for (const t of transitions) {
         if (!approvedKeys.has(t.issueKey)) continue;
         try {
+            const available = await jira.getTransitions(t.issueKey);
+            if (!available.some(candidate => candidate.id === t.transitionId &&
+                candidate.toStatus.toLowerCase() === t.statusTo.toLowerCase())) {
+                throw new Error('The proposed transition is no longer available; request a new reconciliation.');
+            }
             await jira.transitionIssue(
                 t.issueKey,
                 t.transitionId,

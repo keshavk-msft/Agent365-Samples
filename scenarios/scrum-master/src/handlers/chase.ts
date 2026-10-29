@@ -24,8 +24,8 @@ import { TurnContext } from '@microsoft/agents-hosting';
 import { getJiraClient } from '../services/jira';
 import { listTeamMembers, TeamMember, getMemberByAadId } from '../services/team-roster';
 import { sendProactive } from '../services/proactive';
-import { findByField, findByTitle, updateItem } from '../services/sharepoint';
-import { getScheduleConfig } from '../config';
+import { findByField, findByTitle, updateItem, claimItemState } from '../services/sharepoint';
+import { getScheduleConfig, getJiraMode } from '../config';
 import {
     buildBlockerEscalationCard,
 } from '../cards/blocker-escalation.card';
@@ -160,6 +160,10 @@ export async function handleMeetingSubmit(context: TurnContext): Promise<void> {
         return;
     }
     if (action !== 'meeting.book') return;
+    if (getJiraMode() === 'mock') {
+        await context.sendActivity('Offline demo: no calendar invitation was created. Use JIRA_MODE=live to book meetings.');
+        return;
+    }
 
     const slotRaw = String(value?.slot ?? '');
     const [startIso, endIso] = slotRaw.split('|');
@@ -180,7 +184,7 @@ export async function handleMeetingSubmit(context: TurnContext): Promise<void> {
     });
 }
 
-async function bookMeetingAsync(
+export async function bookMeetingAsync(
     ref: ConversationReference,
     value: Record<string, unknown> | undefined,
     smAadId: string,
@@ -188,12 +192,22 @@ async function bookMeetingAsync(
     const issueKey = String(value?.issueKey ?? '');
     const slotRaw = String(value?.slot ?? '');
     const [startIso, endIso] = slotRaw.split('|');
+    const blockerId = String(value?.blockerId ?? '');
+    if (!blockerId || !Number.isFinite(Date.parse(startIso)) ||
+        !Number.isFinite(Date.parse(endIso)) || Date.parse(endIso) <= Date.parse(startIso)) return;
 
     const rows = await findByField<BlockerFields>('blockers', 'Title', issueKey);
-    const b = rows[0]?.fields;
-    if (!b) {
+    const row = rows.find(r => r.id === blockerId);
+    const b = row?.fields;
+    if (!b || !row) {
         await sendProactive(ref, async ctx => {
             await ctx.sendActivity(`Could not find blocker for ${issueKey} — aborting.`);
+        });
+        return;
+    }
+    if (b.State !== 'open' || b.MeetingEventId) {
+        await sendProactive(ref, async ctx => {
+            await ctx.sendActivity(`Blocker ${issueKey} is already ${b.State}; no additional meeting was created.`);
         });
         return;
     }
@@ -225,6 +239,9 @@ async function bookMeetingAsync(
         );
     }
 
+    if (!await claimItemState('blockers', row.id, 'open', 'booking')) return;
+    let calendarAttempted = false;
+    let meetingRecorded = false;
     // Do the calendar work + follow-up message inside one proactive turn so the
     // MCP registration has a live TurnContext to authenticate against.
     await sendProactive(ref, async ctx => {
@@ -234,6 +251,7 @@ async function bookMeetingAsync(
             authHandlerName: AUTH_HANDLER,
         };
         try {
+            calendarAttempted = true;
             const created = await createUnblockMeeting(cc, {
                 subject: `Unblock ${issueKey}`,
                 body: `Auto-booked by Scrum Master.<br/><br/>` +
@@ -243,7 +261,8 @@ async function bookMeetingAsync(
                 attendees,
                 timezone: getScheduleConfig().timezone,
             });
-            await updateBlockerState(rows[0].id, 'booked', created.id);
+            await updateBlockerState(row.id, 'booked', created.id);
+            meetingRecorded = true;
             const stamp = DateTime.fromISO(startIso).setZone(getScheduleConfig().timezone).toFormat('ccc d LLL h:mm a');
             const parts: string[] = [];
             parts.push(`📅 Booked — **${issueKey}** unblock sync at **${stamp}**.`);
@@ -260,10 +279,11 @@ async function bookMeetingAsync(
             }
             await ctx.sendActivity(parts.join(' '));
         } catch (e) {
+            if (meetingRecorded) throw e; // A failed confirmation must not undo the booking.
             console.error('[chase] createUnblockMeeting failed:', (e as Error).message);
             const msg = (e as Error).message;
             if (msg.startsWith('CALENDAR_VERIFY_FAILED')) {
-                await updateBlockerState(rows[0].id, 'booked');
+                await updateBlockerState(row.id, 'booked');
                 await ctx.sendActivity(
                     `⚠️ Calendar tool returned a garbled response for **${issueKey}**. ` +
                     `The meeting was most likely created — please check Outlook to confirm. ` +
@@ -271,10 +291,12 @@ async function bookMeetingAsync(
                 );
             } else {
                 await ctx.sendActivity(
-                    `Sorry — couldn't book the meeting: ${msg}. The blocker is still open.`,
+                    `Booking could not be confirmed: ${msg}. Check Outlook before retrying; the booking claim is retained to prevent duplicate invitations.`,
                 );
             }
         }
+    }).finally(async () => {
+        if (!calendarAttempted) await claimItemState('blockers', row.id, 'booking', 'open');
     });
 }
 
@@ -285,6 +307,12 @@ async function proposeSlotsAsync(
     value: Record<string, unknown> | undefined,
     smAadId: string,
 ): Promise<void> {
+    if (getJiraMode() === 'mock') {
+        await sendProactive(ref, async ctx => {
+            await ctx.sendActivity('Offline demo: meeting-slot lookup is disabled; no Graph or Calendar request was made.');
+        });
+        return;
+    }
     const blockerId = String(value?.blockerId ?? '');
     const issueKey = String(value?.issueKey ?? '');
     const rows = await findByField<BlockerFields>('blockers', 'Title', issueKey);

@@ -37,6 +37,7 @@ import {
     listTeamMembers,
     TeamMember,
     isReachable,
+    upsertConversationReference,
 } from '../services/team-roster';
 import {
     StandupSession,
@@ -46,10 +47,12 @@ import {
     todayKey,
     getSession,
     upsertSession,
-    removeSession,
+    completeSession,
+    getCompletedSession,
+    claimSessionFinalization,
     allExpectedResponded,
 } from '../services/session-store';
-import { getScheduleConfig } from '../config';
+import { getJiraMode, getScheduleConfig } from '../config';
 import { sendProactive } from '../services/proactive';
 import {
     buildStandupRequestCard,
@@ -85,11 +88,39 @@ interface TeamsConfigFields {
 
 // --- triggerStandup ------------------------------------------------------
 
-export async function triggerStandup(opts: {
+interface StandupTriggerOptions {
     initiatedByAadId?: string;
     turnContext?: TurnContext;
     source: 'command' | 'cron' | 'http';
-}): Promise<{ standupId: string; sentTo: number; skipped: number; note?: string }> {
+}
+interface StandupTriggerResult {
+    standupId: string; sentTo: number; skipped: number; note?: string;
+}
+
+let pendingTrigger: Promise<StandupTriggerResult> | undefined;
+const mockTurnContexts = new Map<string, TurnContext>();
+
+async function deliverStandup(
+    standupId: string,
+    reference: NonNullable<TeamMember['conversationReference']>,
+    logic: (context: TurnContext) => Promise<void>,
+): Promise<{ ok: boolean; error?: string }> {
+    const context = getJiraMode() === 'mock' ? mockTurnContexts.get(standupId) : undefined;
+    if (context && reference.conversation?.id === context.activity.conversation?.id) {
+        await logic(context);
+        return { ok: true };
+    }
+    return sendProactive(reference, logic);
+}
+
+export function triggerStandup(opts: StandupTriggerOptions): Promise<StandupTriggerResult> {
+    // Reserve the entire async initialization, before roster and persistence awaits.
+    if (pendingTrigger) return pendingTrigger;
+    pendingTrigger = startStandup(opts).finally(() => { pendingTrigger = undefined; });
+    return pendingTrigger;
+}
+
+async function startStandup(opts: StandupTriggerOptions): Promise<StandupTriggerResult> {
     const src = opts.source;
     const jira = getJiraClient();
     const schedule = getScheduleConfig();
@@ -109,18 +140,30 @@ export async function triggerStandup(opts: {
     // Idempotency: if a session already exists today (from cron OR the /standup command),
     // don't re-fan-out. Callers get a friendly note.
     const existingMem = getSession(standupId);
-    if (existingMem) {
-        const msg = `Standup ${standupId} is already in progress (${existingMem.responses.size}/${existingMem.expectedResponders.size} responded).`;
+    const completed = getCompletedSession(standupId);
+    const persisted = !existingMem && !completed
+        ? await findByTitle<StandupSessionFields>('standupSessions', standupId)
+        : null;
+    if (existingMem || completed || persisted) {
+        const msg = existingMem
+            ? `Standup ${standupId} is already ${existingMem.state === 'open' ? 'in progress' : 'being summarized'} (${existingMem.responses.size}/${existingMem.expectedResponders.size} responded).`
+            : `Standup ${standupId} has already been started or completed today.`;
         console.log(`[standup] ${msg}`);
         if (opts.turnContext) await opts.turnContext.sendActivity(msg);
-        return { standupId, sentTo: existingMem.sentTo.size, skipped: 0, note: msg };
+        return { standupId, sentTo: existingMem?.sentTo.size ?? completed?.sentTo ?? 0, skipped: 0, note: msg };
+    }
+
+    if (getJiraMode() === 'mock' && opts.turnContext) {
+        await upsertConversationReference(opts.turnContext);
     }
 
     // Load roster and issues in parallel.
-    const [members, issues] = await Promise.all([
+    const [members, sprintIssues] = await Promise.all([
         listTeamMembers(),
         jira.searchSprintIssues(sprint.id),
     ]);
+    const subtasks = await jira.getSprintSubtasks(sprint.id, sprintIssues.filter(i => !i.parentKey).map(i => i.key));
+    const issues = Array.from(new Map([...sprintIssues, ...subtasks].map(i => [i.key, i])).values());
 
     // Group Jira issues by team-member AAD id (via JiraAccountId join).
     const itemsByAssignee = new Map<string, JiraIssue[]>();
@@ -161,10 +204,6 @@ export async function triggerStandup(opts: {
         State: 'open',
         ExpectedResponders: JSON.stringify(Array.from(expectedResponders)),
         InitiatedByAadId: opts.initiatedByAadId ?? '',
-    }).catch(err => {
-        // If the row already exists (race between cron and command) the createItem
-        // will 4xx — treat as non-fatal because we already checked in-memory above.
-        console.warn(`[standup] StandupSessions insert warning: ${(err as Error).message}`);
     });
 
     // Build session in memory.
@@ -183,6 +222,7 @@ export async function triggerStandup(opts: {
         responses: new Map(),
     };
     upsertSession(session);
+    if (getJiraMode() === 'mock' && opts.turnContext) mockTurnContexts.set(standupId, opts.turnContext);
 
     // Schedule the cutoff timer only if the cutoff falls today (dev cron loop only).
     const msUntilCutoff = cutoffUtc.getTime() - nowUtc.getTime();
@@ -210,9 +250,10 @@ export async function triggerStandup(opts: {
             assigneeAadId: member.AadObjectId,
             items,
         });
-        const result = await sendProactive(member.conversationReference!, async ctx => {
+        const deliver = async (ctx: TurnContext) => {
             await ctx.sendActivity({ type: 'message', attachments: [card] } as Partial<Activity> as Activity);
-        });
+        };
+        const result = await deliverStandup(standupId, member.conversationReference!, deliver);
         if (result.ok) {
             session.sentTo.add(member.AadObjectId);
             sent++;
@@ -236,7 +277,8 @@ export async function handleStandupSubmit(context: TurnContext): Promise<void> {
     const value = context.activity.value as Record<string, unknown> | undefined;
     const standupId = String(value?.standupId ?? '');
     const claimedAssigneeAadId = String(value?.assigneeAadId ?? '');
-    const actualAadId = context.activity.from?.aadObjectId ?? '';
+    const actualAadId = context.activity.from?.aadObjectId
+        || (getJiraMode() === 'mock' ? context.activity.from?.id : '') || '';
 
     if (!standupId) {
         await context.sendActivity('Standup submit missing `standupId` — please try again.');
@@ -259,6 +301,10 @@ export async function handleStandupSubmit(context: TurnContext): Promise<void> {
     }
 
     const session = getSession(standupId);
+    if (session && session.state !== 'open') {
+        await context.sendActivity(`Standup ${standupId} is already being summarized — no further updates were recorded.`);
+        return;
+    }
     if (!session) {
         await context.sendActivity(
             `Standup ${standupId} has already been summarized or is unknown — I've noted your update for later.`,
@@ -389,7 +435,7 @@ export async function handleStandupSubmit(context: TurnContext): Promise<void> {
 // --- summarizeStandup ----------------------------------------------------
 
 export async function summarizeStandup(session: StandupSession): Promise<void> {
-    if (session.state !== 'open') return;
+    if (!claimSessionFinalization(session)) return;
 
     // Load roster once for display names.
     const members = await listTeamMembers();
@@ -485,7 +531,7 @@ export async function summarizeStandup(session: StandupSession): Promise<void> {
     if (!targetConvRef) {
         console.warn('[standup] No TeamsConfig.primary channel set — falling back to DM the SM.');
         if (smMember?.conversationReference) {
-            await sendProactive(smMember.conversationReference, async ctx => {
+            await deliverStandup(session.standupId, smMember.conversationReference, async ctx => {
                 await ctx.sendActivity({ type: 'message', attachments: [card] } as Partial<Activity> as Activity);
                 if (boardMsg) await ctx.sendActivity(boardMsg);
             });
@@ -495,7 +541,7 @@ export async function summarizeStandup(session: StandupSession): Promise<void> {
     } else {
         try {
             const ref = JSON.parse(targetConvRef);
-            await sendProactive(ref, async ctx => {
+            await deliverStandup(session.standupId, ref, async ctx => {
                 await ctx.sendActivity({ type: 'message', attachments: [card] } as Partial<Activity> as Activity);
                 if (boardMsg) await ctx.sendActivity(boardMsg);
             });
@@ -520,8 +566,9 @@ export async function summarizeStandup(session: StandupSession): Promise<void> {
         console.error('[standup] chase failed (non-fatal):', (e as Error).message);
     }
 
-    // Evict the in-memory session (durable record already in SharePoint).
-    removeSession(session.standupId);
+    // Release heavy response data but retain today's duplicate-fan-out guard.
+    completeSession(session);
+    mockTurnContexts.delete(session.standupId);
 }
 
 // --- helpers -------------------------------------------------------------

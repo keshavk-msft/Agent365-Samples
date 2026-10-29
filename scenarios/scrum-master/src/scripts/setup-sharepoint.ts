@@ -4,7 +4,7 @@
 /**
  * One-time SharePoint provisioning script.
  *
- * Signs in the developer via device-code, creates all six SMA_* lists with the
+ * Signs in the developer via device-code, creates all SMA_* lists with the
  * schemas declared in `services/sharepoint.ts`, and creates the SprintReports
  * document library. Idempotent — running it twice is a no-op.
  *
@@ -71,6 +71,7 @@ async function main() {
             columns: schema.columns.map(col => ({
                 name: col.name,
                 ...COLUMN_TYPE_MAP[col.type],
+                ...(col.unique ? { indexed: true, enforceUniqueValues: true } : {}),
             })),
         });
         console.log(`[setup]   ...created.`);

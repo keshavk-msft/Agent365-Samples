@@ -18,7 +18,7 @@ import { DateTime } from 'luxon';
 
 import { getJiraClient, JiraIssue, JiraSprint } from '../services/jira';
 import { getScheduleConfig } from '../config';
-import { listItems, findByField } from '../services/sharepoint';
+import { listItems, findByField, claimSprintReport, updateItem } from '../services/sharepoint';
 import { listTeamMembers } from '../services/team-roster';
 import { sendProactive } from '../services/proactive';
 
@@ -74,6 +74,7 @@ export function buildSprintReportMarkdown(opts: {
     subtasks: JiraIssue[];        // Jira sub-tasks
     blockers: BlockerFields[];
     tz: string;
+    nextSprintName?: string;
 }): string {
     const { sprint, stories, subtasks, blockers, tz } = opts;
     const start = sprint.startDate ? DateTime.fromISO(sprint.startDate).setZone(tz).toFormat('dd LLL yyyy') : '—';
@@ -81,12 +82,15 @@ export function buildSprintReportMarkdown(opts: {
 
     // Slice work by outcome.
     const doneStories = stories.filter(i => i.issueType === 'Story' && i.status === 'Done');
-    const missedStories = stories.filter(i => i.issueType === 'Story' && i.status !== 'Done');
+    const missedStories = stories.filter(i => ['Story', 'Task'].includes(i.issueType) && i.status !== 'Done');
     const doneBugs = stories.filter(i => i.issueType === 'Bug' && i.status === 'Done');
     const openBugs = stories.filter(i => i.issueType === 'Bug' && i.status !== 'Done');
 
-    const allTasksDone = subtasks.filter(i => i.status === 'Done');
-    const allTasksTotal = subtasks.length;
+    const allTasks = Array.from(new Map(
+        [...stories.filter(i => i.issueType === 'Task'), ...subtasks].map(i => [i.key, i]),
+    ).values());
+    const allTasksDone = allTasks.filter(i => i.status === 'Done');
+    const allTasksTotal = allTasks.length;
 
     const deploymentTasks = allTasksDone.filter(t => RX_DEPLOYMENT.test(t.summary));
     const prodDeployments = deploymentTasks.filter(t => RX_PROD_DEPLOY.test(t.summary));
@@ -176,7 +180,7 @@ export function buildSprintReportMarkdown(opts: {
     lines.push('');
     lines.push('| Action Item | Owner | Target Sprint |');
     lines.push('|---|---|---|');
-    const actions = buildActionItems(missedStories, openBugs, allTasksDone, blockers);
+    const actions = buildActionItems(missedStories, openBugs, allTasksDone, blockers, opts.nextSprintName ?? 'Next sprint (TBD)');
     if (actions.length === 0) {
         lines.push('| _No follow-up actions identified._ | — | — |');
     } else {
@@ -199,7 +203,7 @@ export function buildSprintReportMarkdown(opts: {
     lines.push('');
     lines.push('| Metric | Value |');
     lines.push('|---|---|');
-    lines.push(`| User Stories Delivered | **${doneStories.length}** of ${doneStories.length + missedStories.length} committed |`);
+    lines.push(`| User Stories Delivered | **${doneStories.length}** of ${stories.filter(i => i.issueType === 'Story').length} committed |`);
     lines.push(`| Tasks Completed | **${allTasksDone.length}** of ${allTasksTotal} |`);
     lines.push(`| Bugs Resolved | **${doneBugs.length}** |`);
     lines.push(`| Deployments | **${deploymentTasks.length}** |`);
@@ -217,6 +221,9 @@ export function buildSprintReportMarkdown(opts: {
 function buildDemoHighlights(stories: JiraIssue[], tasksDone: JiraIssue[], bugs: JiraIssue[]): string[] {
     const highlights: string[] = [];
     for (const s of stories.slice(0, 5)) highlights.push(cleanUserStorySummary(s.summary));
+    if (!stories.length) {
+        for (const task of tasksDone.slice(0, 3)) highlights.push(cleanSummary(task.summary));
+    }
     if (tasksDone.some(t => RX_ACCESSIBILITY.test(t.summary))) {
         highlights.push('Accessible and inclusive UI with a11y checks in CI');
     }
@@ -250,6 +257,7 @@ function buildActionItems(
     openBugs: JiraIssue[],
     tasksDone: JiraIssue[],
     blockers: BlockerFields[],
+    nextSprintName: string,
 ): ActionItem[] {
     const actions: ActionItem[] = [];
     // Carry-over stories.
@@ -257,7 +265,7 @@ function buildActionItems(
         actions.push({
             item: `Carry-over: ${cleanUserStorySummary(m.summary)} (${m.key})`,
             owner: m.assignee?.displayName ?? 'Unassigned',
-            sprint: 'Sprint 2',
+            sprint: nextSprintName,
         });
     }
     // Open bugs.
@@ -265,21 +273,21 @@ function buildActionItems(
         actions.push({
             item: `Close open bug: ${cleanSummary(b.summary)} (${b.key})`,
             owner: b.assignee?.displayName ?? 'Bug triage',
-            sprint: 'Sprint 2',
+            sprint: nextSprintName,
         });
     }
     // Cross-cutting suggestions when the theme was missing this sprint.
     if (!tasksDone.some(t => RX_E2E.test(t.summary))) {
-        actions.push({ item: 'Increase automation coverage (E2E + regression)', owner: 'QA Team', sprint: 'Sprint 2' });
+        actions.push({ item: 'Increase automation coverage (E2E + regression)', owner: 'QA Team', sprint: nextSprintName });
     }
     if (!tasksDone.some(t => RX_ACCESSIBILITY.test(t.summary))) {
-        actions.push({ item: 'Introduce accessibility checks in CI/CD', owner: 'Dev Team', sprint: 'Sprint 2' });
+        actions.push({ item: 'Introduce accessibility checks in CI/CD', owner: 'Dev Team', sprint: nextSprintName });
     }
     if (!tasksDone.some(t => /deploy.*checklist|readiness|runbook/i.test(t.summary))) {
-        actions.push({ item: 'Create deployment readiness checklist', owner: 'Release Team', sprint: 'Sprint 2' });
+        actions.push({ item: 'Create deployment readiness checklist', owner: 'Release Team', sprint: nextSprintName });
     }
     if (blockers.length >= 2) {
-        actions.push({ item: 'Retro: root-cause the top blockers to prevent recurrence', owner: 'Scrum Master', sprint: 'Sprint 2' });
+        actions.push({ item: 'Retro: root-cause the top blockers to prevent recurrence', owner: 'Scrum Master', sprint: nextSprintName });
     }
     return actions.slice(0, 6);
 }
@@ -291,10 +299,15 @@ export async function runSprintCloseReport(opts?: { force?: boolean; sprintId?: 
     const jira = getJiraClient();
     const tz = getScheduleConfig().timezone;
 
-    // Pick sprint: explicit id > active sprint.
+    // Closed sprints disappear from the active endpoint as soon as the SM completes them.
     let sprint: JiraSprint | null = null;
     if (opts?.sprintId) sprint = await jira.getSprint(opts.sprintId);
-    else sprint = await jira.getActiveSprint();
+    else if (jira.getSprints) {
+        const [active, closed] = await Promise.all([jira.getSprints('active'), jira.getSprints('closed')]);
+        const ended = [...active, ...closed].filter(s => s.endDate && Date.parse(s.endDate) < Date.now())
+            .sort((a, b) => Date.parse(b.endDate!) - Date.parse(a.endDate!));
+        sprint = ended[0] ?? (opts?.force ? active[0] : null) ?? null;
+    } else sprint = await jira.getActiveSprint(); // Seeded offline client.
     if (!sprint) return { uploaded: false, note: 'No sprint found.' };
 
     const nowMs = Date.now();
@@ -312,41 +325,55 @@ export async function runSprintCloseReport(opts?: { force?: boolean; sprintId?: 
     const subtasks = await jira.getSprintSubtasks(sprint.id, parentKeys);
     const blockers = blockersRows.map(r => r.fields);
 
-    const markdown = buildSprintReportMarkdown({ sprint, stories, subtasks, blockers, tz });
-
+    const following = jira.getSprints
+        ? (await Promise.all([jira.getSprints('future'), jira.getSprints('active')])).flat()
+        : [];
+    const nextSprint = following.filter(s => s.id !== sprint!.id &&
+        (!s.startDate || !sprint!.startDate || Date.parse(s.startDate) > Date.parse(sprint!.startDate)))
+        .sort((a, b) => (a.startDate ? Date.parse(a.startDate) : Infinity) - (b.startDate ? Date.parse(b.startDate) : Infinity))[0];
+    const markdown = buildSprintReportMarkdown({ sprint, stories, subtasks, blockers, tz, nextSprintName: nextSprint?.name });
     // Post inline in the configured Teams channel — no SharePoint upload.
     const configRows = await findByField<TeamsConfigFields>('teamsConfig', 'Title', 'primary').catch(() => []);
     const channelRefRaw = configRows[0]?.fields?.ConversationRef;
+    const claimId = await claimSprintReport(sprint.id);
+    if (!claimId) return { uploaded: false, note: `Sprint ${sprint.name} report already delivered or claimed; no duplicate sent.` };
 
     let delivered = false;
     if (channelRefRaw) {
         try {
             const ref = JSON.parse(channelRefRaw);
-            await sendProactive(ref, async ctx => { await ctx.sendActivity(markdown); });
-            delivered = true;
-            console.log(`[report] Posted Sprint Close Report inline for ${sprint.name}`);
+            const result = await sendProactive(ref, async ctx => { await ctx.sendActivity(markdown); });
+            delivered = result.ok;
+            if (delivered) console.log(`[report] Posted Sprint Close Report inline for ${sprint.name}`);
         } catch (e) {
             console.warn('[report] Bad TeamsConfig ref — falling back to SM DM:', (e as Error).message);
         }
     }
     if (!delivered) {
-        const members = await listTeamMembers();
-        const sm = members.find(m => m.Role === 'SM');
-        if (sm?.conversationReference) {
-            await sendProactive(sm.conversationReference, async ctx => { await ctx.sendActivity(markdown); });
-            delivered = true;
-            console.log('[report] Posted Sprint Close Report to SM DM (channel unavailable)');
+        try {
+            const sm = (await listTeamMembers()).find(m => m.Role === 'SM');
+            if (sm?.conversationReference) {
+                const result = await sendProactive(sm.conversationReference, async ctx => { await ctx.sendActivity(markdown); });
+                delivered = result.ok;
+                if (delivered) console.log('[report] Posted Sprint Close Report to SM DM (channel unavailable)');
+            }
+        } catch (e) {
+            console.warn('[report] SM delivery failed:', (e as Error).message);
         }
     }
 
     const doneStories = stories.filter(i => i.issueType === 'Story' && i.status === 'Done').length;
-    const tasksDone = subtasks.filter(i => i.status === 'Done').length;
+    await updateItem<{ State: string; DeliveredUtc?: string }>('sprintReportsDelivery', claimId, delivered
+        ? { State: 'sent', DeliveredUtc: new Date().toISOString() }
+        : { State: 'failed' });
+    const allTasks = Array.from(new Map([...stories.filter(i => i.issueType === 'Task'), ...subtasks].map(i => [i.key, i])).values());
+    const tasksDone = allTasks.filter(i => i.status === 'Done').length;
     const doneBugs = stories.filter(i => i.issueType === 'Bug' && i.status === 'Done').length;
-    const deployments = subtasks.filter(t => t.status === 'Done' && RX_DEPLOYMENT.test(t.summary)).length;
+    const deployments = allTasks.filter(t => t.status === 'Done' && RX_DEPLOYMENT.test(t.summary)).length;
 
     return {
         uploaded: delivered,
         counts: { stories: doneStories, tasksDone, deployments, bugs: doneBugs },
-        note: delivered ? undefined : 'No delivery target — no TeamsConfig.primary and no SM ConversationRef.',
+        note: delivered ? undefined : 'Report delivery failed or no delivery target is configured; the sprint claim is retryable.',
     };
 }

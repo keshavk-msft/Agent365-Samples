@@ -9,7 +9,7 @@
  * directions so the LLM / user never has to see the raw project key.
  *
  *   toTaskLabel("EDP-14")  -> "Task-14"
- *   toJiraKey("Task-14")   -> "EDP-14"   (reads JIRA_PROJECT_KEY from env)
+ *   toJiraKey("Task-14")   -> "EDP-14"   (live project; SCRUM in mock mode)
  *   toJiraKey("EDP-14")    -> "EDP-14"   (pass-through)
  *   cleanIssueTitle("User Story: X") -> "X"
  */
@@ -30,7 +30,9 @@ export function toTaskLabel(issueKey: string | null | undefined): string {
 export function toJiraKey(input: string | null | undefined): string {
     if (!input) return '';
     const s = String(input).trim();
-    const project = (process.env.JIRA_PROJECT_KEY ?? 'EDP').toUpperCase();
+    const project = (process.env.JIRA_MODE?.trim().toLowerCase() === 'live'
+        ? (process.env.JIRA_PROJECT_KEY?.trim() || 'EDP')
+        : 'SCRUM').toUpperCase();
     // Match task/Task/# prefixes BEFORE the generic canonical regex so
     // "Task-9" is treated as a friendly label, not a made-up TASK project key.
     const taskish = s.match(/^(?:task\s*-?\s*|#)?(\d+)$/i);

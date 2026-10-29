@@ -290,7 +290,7 @@ export async function runSprintSummary(opts?: {
 
     // Post the FULL report inline as a Teams message to the configured channel.
     // No SharePoint upload — the manager wants the summary readable directly in the group chat.
-    const configRows = await findByField<TeamsConfigFields>('teamsConfig', 'Title', 'primary').catch(() => []);
+    const configRows = await findByField<TeamsConfigFields>('teamsConfig', 'Title', 'primary');
     const channelRefRaw = configRows[0]?.fields?.ConversationRef;
 
     const pending = classified.filter(t => t.status !== 'Done');
@@ -301,9 +301,13 @@ export async function runSprintSummary(opts?: {
     if (channelRefRaw) {
         try {
             const ref = JSON.parse(channelRefRaw);
-            await sendProactive(ref, async ctx => { await ctx.sendActivity(markdown); });
-            delivered = true;
-            console.log(`[sprint-summary] Posted to configured channel (${classified.length} tasks, ${reds.length} red / ${ambers.length} amber)`);
+            const result = await sendProactive(ref, async ctx => { await ctx.sendActivity(markdown); });
+            delivered = result.ok;
+            if (delivered) {
+                console.log(`[sprint-summary] Posted to configured channel (${classified.length} tasks, ${reds.length} red / ${ambers.length} amber)`);
+            } else {
+                console.warn('[sprint-summary] Channel delivery failed; trying SM DM:', result.error);
+            }
         } catch (e) {
             console.warn('[sprint-summary] Bad TeamsConfig ref — falling back to SM DM:', (e as Error).message);
         }
@@ -312,16 +316,16 @@ export async function runSprintSummary(opts?: {
         const members = await listTeamMembers();
         const sm = members.find(m => m.Role === 'SM');
         if (sm?.conversationReference) {
-            await sendProactive(sm.conversationReference, async ctx => { await ctx.sendActivity(markdown); });
-            delivered = true;
-            console.log('[sprint-summary] Posted to SM DM (channel unavailable)');
+            const result = await sendProactive(sm.conversationReference, async ctx => { await ctx.sendActivity(markdown); });
+            delivered = result.ok;
+            if (delivered) console.log('[sprint-summary] Posted to SM DM (channel unavailable)');
+            else console.warn('[sprint-summary] SM DM delivery failed:', result.error);
         }
     }
 
     return {
         uploaded: delivered,
         counts: { total: classified.length, pending: pending.length, red: reds.length, amber: ambers.length },
-        note: delivered ? undefined : 'No delivery target — no TeamsConfig.primary and no SM conversation ref.',
+        note: delivered ? undefined : 'Report was not delivered: delivery failed or no Teams channel/SM destination is configured.',
     };
 }
-

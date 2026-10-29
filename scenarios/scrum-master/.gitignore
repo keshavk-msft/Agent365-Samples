@@ -19,6 +19,8 @@ azure-functions/src/**/*.js.map
 
 # generated at first `npx a365` run — contains tenant/agent IDs
 a365.generated.config.json
+a365.config.json
+.a365-workspace-detection.local.json
 
 # dev logs
 dev-out.txt

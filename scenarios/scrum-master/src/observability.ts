@@ -34,6 +34,7 @@ import {
     AgenticTokenCacheInstance,
     BaggageBuilderUtils,
 } from '@microsoft/agents-a365-observability-hosting';
+import tokenCache, { createAgenticTokenCacheKey } from './token-cache';
 
 const OBSERVABILITY_SCOPE = 'api://9b975845-388f-4429-889e-eab1ef63949c/.default';
 
@@ -141,6 +142,11 @@ export async function ensureObservabilityToken(
                 authorization,
                 [OBSERVABILITY_SCOPE]
             );
+            if (process.env.Use_Custom_Resolver === 'true') {
+                const token = AgenticTokenCacheInstance.getObservabilityToken(agentId, tenantId);
+                if (!token) throw new Error('Observability token refresh returned no cached token');
+                tokenCache.set(createAgenticTokenCacheKey(agentId, tenantId), token);
+            }
         } catch (err) {
             console.warn(
                 `[observability] token refresh failed for agentId=${agentId.slice(0, 8)}… — spans for this turn may be dropped: ${(err as Error)?.message ?? err}`

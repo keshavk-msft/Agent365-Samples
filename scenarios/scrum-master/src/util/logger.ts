@@ -28,6 +28,20 @@ function shouldLog(level: Level): boolean {
     return LEVELS.indexOf(level) <= LEVELS.indexOf(currentLevel());
 }
 
+let consoleInstalled = false;
+
+export function installConsoleLogging(): void {
+    if (consoleInstalled) return;
+    consoleInstalled = true;
+    const methods = { error: 'error', warn: 'warn', log: 'info', info: 'info', debug: 'debug', trace: 'trace' } as const;
+    for (const method of Object.keys(methods) as Array<keyof typeof methods>) {
+        const original = console[method].bind(console);
+        console[method] = (...args: unknown[]) => {
+            if (shouldLog(methods[method])) original(...args);
+        };
+    }
+}
+
 function stamp(): string {
     // HH:MM:SS.mmm — matches the format the base sample's connector logs use.
     return new Date().toISOString().slice(11, 23);

@@ -6,7 +6,7 @@
  *
  * When LOCAL_CRON=true (default in dev), spins up two node-cron jobs:
  *   - STANDUP_CRON  → calls the same triggerStandup() the HTTP endpoint uses
- *   - NIGHTLY_CRON  → runs warn + report checks
+ *   - NIGHTLY_CRON  → runs warn + close report + T-2 RAG report checks
  *
  * The Azure Function projects under `azure-functions/` do the same thing when
  * the agent is deployed. Both are safe to fire simultaneously — session IDs
@@ -19,6 +19,7 @@ import { getScheduleConfig } from '../config';
 import { triggerStandup } from '../handlers/standup';
 import { runWarnCheck } from '../handlers/warn';
 import { runSprintCloseReport } from '../handlers/report';
+import { runSprintSummary } from '../handlers/sprint-summary';
 
 let started = false;
 
@@ -30,7 +31,7 @@ export function startLocalScheduler(): void {
         return;
     }
 
-    console.log(`[cron] Starting local scheduler in tz=${cfg.timezone}`);
+    console.log(`[cron] Starting local scheduler in UTC (display tz=${cfg.timezone})`);
     console.log(`[cron]   Standup: ${cfg.standupCron}`);
     console.log(`[cron]   Nightly: ${cfg.nightlyCron}`);
 
@@ -41,15 +42,17 @@ export function startLocalScheduler(): void {
         } catch (e) {
             console.error('[cron] Standup failed:', (e as Error).message);
         }
-    }, { timezone: cfg.timezone });
+    }, { timezone: 'UTC' });
 
     cron.schedule(cfg.nightlyCron, async () => {
-        console.log('[cron] Nightly tick — warn + report');
+        console.log('[cron] Nightly tick — warn + close report + T-2 RAG report');
         try { await runWarnCheck(); }
         catch (e) { console.error('[cron] warn failed:', (e as Error).message); }
         try { await runSprintCloseReport(); }
         catch (e) { console.error('[cron] report failed:', (e as Error).message); }
-    }, { timezone: cfg.timezone });
+        try { await runSprintSummary(); }
+        catch (e) { console.error('[cron] mid-sprint report failed:', (e as Error).message); }
+    }, { timezone: 'UTC' });
 
     started = true;
 }
