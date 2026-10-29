@@ -43,11 +43,13 @@ Fast path (mock standup): **Node.js and npm are required.** Jira and roster data
 
 | Requirement | Needed for | Notes |
 |---|---|---|
-| **Node.js ≥ 18** | Everything | Any current LTS |
+| **Node.js ≥ 22** | Agent host | Required by the OpenAI Agents SDK; use a current LTS |
 | **Azure OpenAI or OpenAI API key** | Q&A + calendar tool | `gpt-4o` recommended |
 | Atlassian Cloud (free) | Live Jira mode | Skip if `JIRA_MODE=mock`. [Sign up](https://www.atlassian.com/software/jira/free) |
 | Microsoft 365 dev tenant | Live SharePoint mode | Skip if you only exercise the Q&A path |
 | Agent 365 CLI | Deploying to Teams | Not needed for local Playground testing |
+
+The agent uses OpenAI Agents SDK 0.7.x to match the Agent 365 OpenAI adapters, OpenAI 6.x, and Zod 4.6.6 or later. Keep these dependencies compatible when upgrading; older Zod releases are affected by [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5).
 
 ## Quick start — mock mode (no external services)
 
@@ -334,7 +336,7 @@ Do not delete or reset a claim merely because a timer/card action was retried.
 
 ## Deploy to Azure
 
-Recommended target: **Azure App Service (Node 18/20) + Azure Functions timers**.
+Recommended target: **Azure App Service (Node 22 or later) + Azure Functions timers**.
 
 Minimum runtime configuration:
 
